@@ -41,7 +41,6 @@ def correct_annotation_timestamp_np(anfalds_tidspunkt: np.datetime64) -> np.date
     else:
         return anfalds_tidspunkt - np.timedelta64(1, 'h')  # Winter time: UTC+1
     
-
 def Load_full_ecg_data(patient_id: str):
     """
     Load full ECG signal + all seizure annotations for a patient.
@@ -104,4 +103,3 @@ def Load_full_ecg_data(patient_id: str):
         "SampleRate": sample_rate
     }
 
-Load_full_ecg_data("Patient 2")

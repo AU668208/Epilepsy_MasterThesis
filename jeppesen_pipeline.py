@@ -144,6 +144,91 @@ def detect_events(feature_series, times, thr, min_separation_beats=50):
             merged.append(ev)
     return merged
 
+def _choose_polarity_from_first16s(x, fs):
+    n = int(16*fs)
+    seg = x[:min(len(x), n)]
+    if seg.size == 0: return 1.0
+    pos95 = np.percentile(seg, 95)
+    neg05 = np.percentile(seg, 5)
+    return 1.0 if pos95 >= abs(neg05) else -1.0
+
+def _apply_local_polarity(x, fs, win_s=2.0):
+    L = int(round(win_s*fs))
+    y = x.copy()
+    for st in range(0, len(x), L):
+        en = min(len(x), st+L)
+        seg = x[st:en]
+        if seg.size:
+            if abs(np.min(seg)) > np.max(seg):
+                y[st:en] = -seg
+    return y
+
+import numpy as np
+from scipy.signal import remez, kaiserord, filtfilt
+
+def preprocess_labview(
+    ecg: np.ndarray,
+    fs: float,
+    *,
+    delete_start_s: float = 0.0,
+    delete_end_s: float = 0.0,
+    hp_stop_freq: float = 0.3,   # "stop freq" (dæmpet område)
+    hp_pass_freq: float = 0.5,   # "pass freq" (fladt område)
+    ripple_db: float = 0.5,      # passband ripple (≈ vægt i remez)
+    attn_db: float = 60.0,       # stopband attenuation (til ordensestimat)
+    smooth_win_samples: int = 4  # moving average = 4 samples (rectangular)
+):
+    """
+    Reproducerer LabVIEW-preprocessing-blokken:
+      1) klip start/slut (sek),
+      2) equiripple high-pass (stop/pass),
+      3) 4-sample moving average.
+    Returnerer (y, t0_shift_samples), hvor t0_shift_samples fortæller,
+    hvor mange samples der er fjernet i starten (til tidsmapning).
+    """
+    x = np.asarray(ecg, dtype=float)
+
+    # --- 1) Klip start/slut ---
+    n0 = int(round(delete_start_s * fs))
+    n1 = int(round(delete_end_s * fs))
+    if n0 + n1 >= len(x):
+        raise ValueError("delete_start_s + delete_end_s fjerner hele signalet.")
+    x = x[n0: len(x) - n1 if n1 > 0 else len(x)]
+    t0_shift_samples = n0
+
+    # --- 2) Equiripple high-pass (Parks–McClellan) ---
+    nyq = fs / 2.0
+    if not (0 < hp_stop_freq < hp_pass_freq < nyq):
+        raise ValueError("Kræv: 0 < hp_stop_freq < hp_pass_freq < fs/2.")
+
+    # estimer ordensbehov via Kaiser-formlen (bruges kun som startbud)
+    trans_width = (hp_pass_freq - hp_stop_freq) / nyq
+    N, beta = kaiserord(attn_db, trans_width)
+    # remez foretrækker ulige tap-antal i high-pass for bedre symmetri
+    numtaps = max(31, N | 1)
+
+    # remez-bånd (Hz) og ønsket respons
+    bands   = [0.0, hp_stop_freq, hp_pass_freq, nyq]
+    desired = [0.0, 1.0]
+    # vægte: lav ripple i pass, høj dæmpning i stop
+    weight  = [10.0, 1.0]  # mere vægt på stopbånd
+    taps = remez(numtaps, bands, desired, weight=weight, fs=fs, type="bandpass")
+
+    # zero-phase filtrering
+    x_hp = filtfilt(taps, [1.0], x, padlen=min(3*len(taps), len(x)-1))
+
+    # --- 3) 4-sample moving average (rectangular) ---
+    M = max(1, int(smooth_win_samples))
+    if M == 1:
+        x_smooth = x_hp
+    else:
+        kernel = np.ones(M, dtype=float) / M
+        # 'same' + zero-phase (via centered kernel) – convolution alene
+        x_smooth = np.convolve(x_hp, kernel, mode="same")
+
+    return x_smooth, t0_shift_samples
+
+
 # -----------------------------
 # R-peak detektorer
 # -----------------------------
@@ -168,25 +253,40 @@ class LVParams:
     win_s: float = 2.0
     thigh_alpha: float = 0.75
     fwd_bwd_radius_samp: int = 15
-    refractory_s: float = 0.25
     delta_thresh_samples: int = 35
     rrshort_n: int = 8
     rrlong_n: int = 34
+    refractory_s: float = 0.25
     rmax_clip_low_s: float = 0.4
     rmax_clip_high_s: float = 1.2
+    auto_polarity: str = "global16s"   # <- dette er den nye linje
+
+
 
 class LabVIEWRpeak:
-    """Jeppesen/LabVIEW-agtig R-peak detektor: 2s vinduer, T(high)/T(low), Rmax, DELTA, ±15 lokalisering, 0.25s refr."""
+    """
+    Jeppesen/LabVIEW-lignende R-peak-detektor:
+      - 2s vinduer, T(high)=0.75*median(max af seneste 8 vinduer), T(low)=0.4*T(high)
+      - Refractory 0.25 s
+      - Lokaliseringsradius ±15 samples @256 Hz (auto-skaleret med fs)
+      - DELTA-variabilitetsgrænse 35 samples @256 Hz (auto-skaleret med fs)
+      - Valgfri auto-polaritet: 'none' | 'global16s' | 'per_window'
+    """
     def __init__(self, params: LVParams):
         self.p = params
+        # auto-skalering af sample-baserede konstanter
+        scale = max(1.0, self.p.fs/256.0)
+        self._radius = max(1, int(round(self.p.fwd_bwd_radius_samp * scale)))
+        self._delta_thr = max(1, int(round(self.p.delta_thresh_samples * scale)))
 
+    # ---- interne hjælpere ----
     def _window_max_series(self, sig):
-        fs = self.p.fs; L = int(round(self.p.win_s * fs))
+        fs = self.p.fs; L = int(round(self.p.win_s*fs))
         rect = np.maximum(sig, 0.0)
-        m = []; edges = []
+        m, edges = [], []
         for st in range(0, len(rect), L):
-            en = min(len(rect), st + L)
-            m.append(np.max(rect[st:en]) if en > st else 0.0)
+            en = min(len(rect), st+L)
+            m.append(np.max(rect[st:en]) if en>st else 0.0)
             edges.append((st, en))
         return np.array(m), edges
 
@@ -197,96 +297,110 @@ class LabVIEWRpeak:
             if k == 0:
                 thigh[k] = alpha * window_max[0]
             else:
-                lo = max(0, k - 8)
-                ref = window_max[lo:k] if k > 0 else window_max[:1]
-                med = np.median(ref) if ref.size > 0 else window_max[k]
+                lo = max(0, k-8)
+                ref = window_max[lo:k]
+                med = np.median(ref) if ref.size else window_max[k]
                 thigh[k] = alpha * med
         return thigh
 
     def _fwd_bwd_localise(self, x, idx):
-        r = self.p.fwd_bwd_radius_samp
-        st = max(0, idx - r); en = min(len(x), idx + r + 1)
+        r = self._radius
+        st = max(0, idx-r); en = min(len(x), idx+r+1)
         if en <= st: return idx
         seg = x[st:en]; off = np.argmax(seg)
         return st + off
 
+    # ---- hoveddetektion ----
     def detect(self, ecg):
+        x = ecg.astype(float)
+
+        # Auto-polaritet
+        if self.p.auto_polarity == "global16s":
+            pol = _choose_polarity_from_first16s(x, self.p.fs)
+            x = x * pol
+        elif self.p.auto_polarity == "per_window":
+            x = _apply_local_polarity(x, self.p.fs, self.p.win_s)
+
+        # Filtrering som i pipen
         fs = self.p.fs
-        bp = bandpass_filter(ecg, fs, 0.5, 32.0, 4)
+        bp = bandpass_filter(x, fs, 0.5, 32.0, 4)
 
+        # T(high)/T(low)
         wmax, edges = self._window_max_series(bp)
-        thigh_series = self._thigh_series(wmax)
-
+        thigh_w = self._thigh_series(wmax)
         thigh = np.zeros(len(bp))
-        for k, (st, en) in enumerate(edges):
-            thigh[st:en] = thigh_series[k]
+        for k,(st,en) in enumerate(edges):
+            thigh[st:en] = thigh_w[k]
         tlow = 0.4 * thigh
 
-        peaks = []; rr_list = []
+        peaks, rr_list = [], []
         refr = int(round(self.p.refractory_s * fs))
         Lwin = int(round(self.p.win_s * fs))
-        last_window_det = False; next_window_edge = Lwin
+        last_window_det = False; next_edge = Lwin
 
         i = 0
         while i < len(bp):
             if peaks and i - peaks[-1] < refr:
                 i += 1; continue
 
-            thr = thigh[i]; use_tlow = False
-            if len(peaks) > 0:
+            # Rmax/DELTA searchback-beslutning
+            use_tlow = False
+            if peaks:
                 dt = (i - peaks[-1]) / fs
-                rlong = np.median(rr_list[-self.p.rrlong_n:]) if len(rr_list) >= 2 else 0.8
+                rlong = np.median(rr_list[-self.p.rrlong_n:]) if len(rr_list)>=2 else 0.8
                 rmax = np.clip(rlong, self.p.rmax_clip_low_s, self.p.rmax_clip_high_s)
                 if dt >= rmax:
                     use_tlow = True
 
             if not use_tlow:
-                if bp[i] > thr and (i == 0 or bp[i-1] <= thr):
+                # Thigh-kryds
+                if bp[i] > thigh[i] and (i==0 or bp[i-1] <= thigh[i-1]):
                     idx = self._fwd_bwd_localise(bp, i)
-                    if (idx == 0 or bp[idx] >= bp[idx-1]) and (idx == len(bp)-1 or bp[idx] >= bp[idx+1]):
-                        if len(peaks) == 0 or idx - peaks[-1] >= refr:
+                    # simpel top
+                    if (idx==0 or bp[idx]>=bp[idx-1]) and (idx==len(bp)-1 or bp[idx]>=bp[idx+1]):
+                        if not peaks or idx - peaks[-1] >= refr:
                             peaks.append(idx); last_window_det = True
-                            if len(peaks) >= 2: rr_list.append((peaks[-1] - peaks[-2]) / fs)
+                            if len(peaks)>=2: rr_list.append((peaks[-1]-peaks[-2])/fs)
                             i = idx + 1; continue
             else:
+                # Tlow searchback med variabilitetsmode
                 if len(rr_list) >= 3:
-                    seg_rr = np.array(rr_list[-self.p.rrlong_n:]) if len(rr_list) >= self.p.rrlong_n else np.array(rr_list)
+                    seg_rr = np.array(rr_list[-self.p.rrlong_n:]) if len(rr_list)>=self.p.rrlong_n else np.array(rr_list)
                     if seg_rr.size >= 5:
                         med = np.median(seg_rr)
                         eps = np.abs(seg_rr - med)
                         if eps.size >= 2:
-                            idx_rm = np.argsort(eps)[-2:]; mask = np.ones_like(eps, bool); mask[idx_rm] = False
-                            delta_val = np.mean(eps[mask]) if mask.any() else np.mean(eps)
+                            rm = np.argsort(eps)[-2:]
+                            keep = np.ones_like(eps, bool); keep[rm] = False
+                            delta_val = np.mean(eps[keep]) if keep.any() else np.mean(eps)
                         else:
                             delta_val = np.mean(eps)
-                        delta_samples = delta_val * fs
-                        high_var = (delta_samples > self.p.delta_thresh_samples)
+                        high_var = (delta_val * fs > self._delta_thr)
                     else:
                         high_var = False
                     lookback_rr = self.p.rrshort_n if high_var else self.p.rrlong_n
-                    lookback_s = np.sum(rr_list[-lookback_rr:]) if len(rr_list) >= 1 else 2.0
+                    lookback_s = np.sum(rr_list[-lookback_rr:]) if rr_list else 2.0
                 else:
                     lookback_s = 2.0
-                lookback_samp = int(round(lookback_s * fs))
-                st = max(0, i - lookback_samp)
+
+                st = max(0, i - int(round(lookback_s*fs)))
                 seg = bp[st:i+1]; tl = tlow[st:i+1]
                 cand = np.where(seg >= tl)[0]
-                if cand.size > 0:
+                if cand.size:
                     ci = st + cand[np.argmax(seg[cand])]
                     ci = self._fwd_bwd_localise(bp, ci)
-                    if len(peaks) == 0 or ci - peaks[-1] >= refr:
+                    if not peaks or ci - peaks[-1] >= refr:
                         peaks.append(ci); last_window_det = True
-                        if len(peaks) >= 2: rr_list.append((peaks[-1] - peaks[-2]) / fs)
+                        if len(peaks)>=2: rr_list.append((peaks[-1]-peaks[-2])/fs)
                         i = ci + 1; continue
 
-            if i >= next_window_edge - 1:
-                if not last_window_det:
-                    pass  # shadow-behaviour placeholder
+            if i >= next_edge - 1:
                 last_window_det = False
-                next_window_edge += Lwin
+                next_edge += Lwin
             i += 1
 
         return np.array(sorted(set(peaks)), dtype=int)
+
 
 # -----------------------------
 # TDMS read helpers
@@ -365,7 +479,7 @@ def read_tdms_auto(tdms_path, fs_override=None, index_path=None):
         except Exception:
             timestamps = None
 
-    # valgfrit: forsøg at læse fra sidecar/index
+    # valgfrit: forsøg at læse fra index
     if timestamps is None and index_path is not None:
         try:
             td_idx = TdmsFile.read(index_path)
@@ -464,10 +578,32 @@ def run_pipeline_from_ecg(
     elif t is None:
         t = np.arange(len(ecg)) / fs
 
-    if rpeak_mode == "simple":
+        if rpeak_mode == "simple":
         peaks = rpeaks_simple(ecg, fs)
     else:
-        peaks = LabVIEWRpeak(LVParams(fs=fs)).detect(ecg)
+        # NY: brug LVParams med auto-polaritet og auto-skalering (default global16s)
+        lv = LabVIEWRpeak(LVParams(fs=fs, auto_polarity="global16s"))
+        peaks = lv.detect(ecg)
+
+    # --- LabVIEW præ-processing ---
+    ecg_proc, t0_shift = preprocess_labview(
+        ecg, fs,
+        delete_start_s=0.0, delete_end_s=0.0,
+        hp_stop_freq=0.3, hp_pass_freq=0.5,
+        smooth_win_samples=4
+    )
+
+    # opdater tidsakse, hvis du bruger 't'
+    if t is not None:
+        t = t[t0_shift: t0_shift + len(ecg_proc)]
+
+    # --- R-peak detektion på ecg_proc ---
+    if rpeak_mode == "simple":
+        peaks = rpeaks_simple(ecg_proc, fs)
+    else:
+        # (helst med auto-polaritet + fs-skalering når du har patchet modulet)
+        peaks = LabVIEWRpeak(LVParams(fs=fs)).detect(ecg_proc)
+
 
     rr_sec, t_rr = rr_from_peaks(peaks, fs)
     if len(rr_sec) < max(10, window_beats + 1):

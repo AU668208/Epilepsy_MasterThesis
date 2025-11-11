@@ -28,6 +28,10 @@
 # - For TDMS, it will auto-pick the first channel if channel_hint is not provided.
 # - All plots use matplotlib with default styling (no specific colors set).
 
+from __future__ import annotations
+from typing import Optional, Tuple, Iterable, Dict, Any
+import re
+from datetime import datetime, date, time, timezone
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 import numpy as np
@@ -63,45 +67,158 @@ class RecordingMeta:
     units: Optional[str] = None  # Engineering units if available (e.g., mV)
     path: Optional[str] = None   # Source file path
 
+# ---------------------------
+# Helpers: time parsing & correction
+# ---------------------------
 
-def _to_datetime_safe(x) -> Optional[datetime]:
-    if pd.isna(x):
+_TZ_EU_CPH = "Europe/Copenhagen"
+
+def _to_datetime_safe(value: Any) -> Optional[datetime]:
+    """
+    Try to coerce common TDMS/NI property values into a Python datetime.
+    Returns timezone-aware or naive depending on the input.
+    If the value cannot be parsed, returns None.
+    """
+    if value is None:
         return None
-    # Try pandas to_datetime first
+
+    # Already datetime?
+    if isinstance(value, datetime):
+        return value
+
+    # Pandas/Timestamp?
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+
+    # Numeric epoch? (seconds or milliseconds)
+    if isinstance(value, (int, float)):
+        # Heuristic: treat very large numbers as ms epoch
+        try:
+            if value > 1e12:
+                # ms
+                return datetime.utcfromtimestamp(value / 1000.0)
+            elif value > 1e9:
+                # seconds in epoch ~ 2001+; still fine
+                return datetime.utcfromtimestamp(value)
+        except Exception:
+            pass
+
+    # String parsing
     try:
-        dt = pd.to_datetime(x, errors="raise", dayfirst=True, utc=False)
-        # If it's timezone-aware already, keep it. Otherwise localize to Europe/Copenhagen
-        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
-            return dt.tz_localize("Europe/Copenhagen", ambiguous="NaT", nonexistent="NaT")
-        return dt
+        # pandas is robust to many NI/TDMS formats
+        ts = pd.to_datetime(str(value), utc=False, errors="raise")
+        # to_pydatetime preserves timezone info if present
+        return ts.to_pydatetime()
     except Exception:
         return None
 
 
-def load_tdms(path: str, channel_hint: Optional[str] = None) -> Tuple[np.ndarray, RecordingMeta]:
+def _to_local_naive(dt: datetime, prefer_tz: str = "Europe/Copenhagen", assume_source_tz: Optional[str] = "UTC") -> datetime:
+    """
+    Convert an input datetime to *local clock time* in `prefer_tz`,
+    then drop timezone info so the result is NAIVE.
+    Rules:
+      - If `dt` already has tzinfo -> convert to prefer_tz, then return dt.replace(tzinfo=None).
+      - If `dt` is naive:
+          * If `assume_source_tz` is not None, interpret `dt` as that tz,
+            then convert to prefer_tz, and drop tzinfo.
+          * If `assume_source_tz` is None, treat `dt` as already local clock time and just return it.
+    """
+    from dateutil import tz as _tz
+
+    if dt.tzinfo is not None:
+        # tz-aware -> to local -> make naive
+        local = dt.astimezone(_tz.gettz(prefer_tz))
+        return local.replace(tzinfo=None)
+
+    # naive input
+    if assume_source_tz:
+        src = _tz.gettz(assume_source_tz)
+        as_src = dt.replace(tzinfo=src)
+        local = as_src.astimezone(_tz.gettz(prefer_tz))
+        return local.replace(tzinfo=None)
+    else:
+        # Already intended as local clock time; leave as-is but ensure it's a true datetime
+        return dt
+
+
+def _first_present(d: Mapping[str, Any], keys: list[str]) -> Any:
+    """Return the first found value for any of `keys` in mapping `d`, else None."""
+    for k in keys:
+        if k in d:
+            return d[k]
+    return None
+
+
+def _extract_tdms_start_time(props_chain: list[Mapping[str, Any]]) -> Optional[datetime]:
+    """
+    Look through a chain of property dicts (channel -> group -> file) and
+    try to find a plausible start time field.
+    """
+    candidate_keys = [
+        # very common NI / nptdms keys
+        "wf_start_time", "NI_wfStartTime",
+        # other plausible labels
+        "start_time", "Start Time", "Timestamp",
+        "NI_ExpStartTimeStamp", "NI_ExpTimeStamp",  # sometimes present
+        "Date", "Time"  # rarely useful alone, but pandas can sometimes parse combined strings upstream
+    ]
+    for props in props_chain:
+        raw = _first_present(props, candidate_keys)
+        if raw is None:
+            continue
+        dt = _to_datetime_safe(raw)
+        if dt is not None:
+            return dt
+    return None
+
+
+# ---------------------------
+# Public: refined loader using helpers
+# ---------------------------
+def load_tdms(path: str, channel_hint: Optional[str] = None,
+              prefer_tz: str = "Europe/Copenhagen",
+              assume_source_tz: Optional[str] = "UTC",
+              prefer_naive_local: bool = True) -> Tuple[np.ndarray, RecordingMeta]:
     """
     Load a TDMS file and return (signal, metadata).
-    Attempts to extract fs and start_time from TDMS properties commonly used by NI.
+
+    - Sampling frequency (fs) is inferred from common NI/nptdms properties.
+    - Start time is read from channel/group/file properties.
+    - If `prefer_naive_local` is True (default), `start_time` is returned as a NAIVE datetime
+      in the `prefer_tz` local clock (i.e., '11:05:02', not '09:05:02+02:00').
+      For naive inputs we assume the source timestamp is in `assume_source_tz` (default 'UTC').
+
+    Args:
+        path: Path to the TDMS file.
+        channel_hint: Optional substring to help pick the intended channel.
+        prefer_tz: IANA name of the intended local time zone (default Europe/Copenhagen).
+        assume_source_tz: If input start time is naive, interpret it as being in this tz (default 'UTC').
+        prefer_naive_local: If True, convert to `prefer_tz` and drop tzinfo (return naive).
+
+    Returns:
+        (signal: np.ndarray[float], meta: RecordingMeta)
     """
     if not NPTDMS_AVAILABLE:
         raise ImportError("nptdms is not installed. Please `pip install nptdms`.")
+
     tf = TdmsFile.read(path)
 
-    # Choose a group and channel
+    # --- Choose group and channel ---
     groups = tf.groups()
-    if len(groups) == 0:
+    if not groups:
         raise ValueError("No groups found in TDMS.")
     grp = groups[0]
-    # Find channel by hint or the first available
+
     channels = grp.channels()
-    if len(channels) == 0:
-        # Try any channel across groups
+    if not channels:
+        # fall back to first channel across all groups
         channels = [ch for g in tf.groups() for ch in g.channels()]
-        if len(channels) == 0:
+        if not channels:
             raise ValueError("No channels found in TDMS.")
 
     ch = None
-    if channel_hint is not None:
+    if channel_hint:
         for c in channels:
             if channel_hint.lower() in c.name.lower():
                 ch = c
@@ -109,77 +226,80 @@ def load_tdms(path: str, channel_hint: Optional[str] = None) -> Tuple[np.ndarray
     if ch is None:
         ch = channels[0]
 
-    data = ch[:]
-    data = np.asarray(data).astype(float)
-    n_samples = data.shape[0]
+    # --- Read signal ---
+    data = np.asarray(ch[:], dtype=float)
+    n_samples = int(data.shape[0])
 
-    # Default fs and start_time fallbacks
+    # --- Properties (channel -> group -> file) ---
+    ch_props   = getattr(ch, "properties", {}) or {}
+    grp_props  = getattr(grp, "properties", {}) or {}
+    file_props = getattr(tf, "properties", {}) or {}
+    props_chain = [ch_props, grp_props, file_props]
+
+    # --- Units ---
+    units = (
+        _first_present(ch_props, ["unit_string", "NI_UnitDescription", "unit"])
+        or None
+    )
+
+    # --- Sampling frequency ---
     fs = None
-    start_time = None
-    units = None
-
-    # Try common property keys
-    props = ch.properties
-    grp_props = grp.properties
-    file_props = tf.properties
-
-    # Units
-    units = props.get("unit_string") or props.get("NI_UnitDescription") or props.get("unit") or None
-
-    # Sampling period
-    wf_increment = props.get("wf_increment") or props.get("NI_wfIncrement") or None
-    if wf_increment:
+    wf_increment = _first_present(ch_props, ["wf_increment", "NI_wfIncrement"])
+    if wf_increment is not None:
         try:
             fs = 1.0 / float(wf_increment)
         except Exception:
             fs = None
 
-    # Sampling freq direct
     if fs is None:
         for key in ["fs", "sampling_frequency", "Sample Rate", "NI_SampleRate"]:
-            if key in props:
+            v = ch_props.get(key)
+            if v is None:
+                v = grp_props.get(key)
+            if v is None:
+                v = file_props.get(key)
+            if v is not None:
                 try:
-                    fs = float(props[key])
+                    fs = float(v)
                     break
                 except Exception:
                     pass
 
-    # Start time
-    for source_props in (props, grp_props, file_props):
-        if start_time is not None:
-            break
-        for key in ["wf_start_time", "NI_wfStartTime", "start_time", "Start Time", "Timestamp"]:
-            if key in source_props:
-                st = source_props[key]
-                # nptdms may provide datetime already
-                if isinstance(st, datetime):
-                    start_time = st
-                else:
-                    start_time = _to_datetime_safe(st)
-                break
-
-    # Fallbacks
     if fs is None:
-        fs = 512.0  # default to your stated sample rate
+        fs = 512.0  # sensible default for your dataset
         warnings.warn("Could not read sampling frequency from TDMS; defaulting to fs=512 Hz.")
-    if start_time is None:
-        # Assume 'now' as a placeholder; user should override if needed.
-        start_time = pd.Timestamp.now(tz="Europe/Copenhagen").to_pydatetime()
-        warnings.warn("Could not read start time from TDMS; defaulting to now().")
 
-    if getattr(start_time, 'tzinfo', None) is None:
-        from dateutil import tz as _tz
-        start_time = start_time.replace(tzinfo=_tz.gettz("Europe/Copenhagen"))
+    # --- Start time (correct to NAIVE local if requested) ---
+    start_time_raw = _extract_tdms_start_time(props_chain)
+
+    if start_time_raw is None:
+        warnings.warn("Could not read start time from TDMS; defaulting to current local time.")
+        # Use current time in prefer_tz as naive
+        now_local = pd.Timestamp.now(tz=prefer_tz).to_pydatetime()
+        start_time = now_local.replace(tzinfo=None)
+    else:
+        if prefer_naive_local:
+            # Convert to prefer_tz, then drop tzinfo -> NAIVE local clock time
+            start_time = _to_local_naive(
+                start_time_raw,
+                prefer_tz=prefer_tz,
+                assume_source_tz=assume_source_tz
+            )
+        else:
+            # Keep timezone if any; otherwise keep naive
+            start_time = start_time_raw
 
     meta = RecordingMeta(
         fs=float(fs),
-        start_time=start_time,
-        n_samples=int(n_samples),
+        start_time=start_time,          # <— NAIVE local datetime if prefer_naive_local=True
+        n_samples=n_samples,
         channel_name=str(ch.name),
         units=units,
         path=path,
     )
     return data, meta
+
+
 
 
 def _read_excel_any(path: str) -> pd.DataFrame:

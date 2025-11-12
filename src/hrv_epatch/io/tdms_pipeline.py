@@ -270,24 +270,7 @@ def load_tdms(path: str, channel_hint: Optional[str] = None,
         warnings.warn("Could not read sampling frequency from TDMS; defaulting to fs=512 Hz.")
 
     # --- Start time (correct to NAIVE local if requested) ---
-    start_time_raw = _extract_tdms_start_time(props_chain)
-
-    if start_time_raw is None:
-        warnings.warn("Could not read start time from TDMS; defaulting to current local time.")
-        # Use current time in prefer_tz as naive
-        now_local = pd.Timestamp.now(tz=prefer_tz).to_pydatetime()
-        start_time = now_local.replace(tzinfo=None)
-    else:
-        if prefer_naive_local:
-            # Convert to prefer_tz, then drop tzinfo -> NAIVE local clock time
-            start_time = _to_local_naive(
-                start_time_raw,
-                prefer_tz=prefer_tz,
-                assume_source_tz=assume_source_tz
-            )
-        else:
-            # Keep timezone if any; otherwise keep naive
-            start_time = start_time_raw
+    start_time = _extract_tdms_start_time(props_chain)
 
     meta = RecordingMeta(
         fs=float(fs),

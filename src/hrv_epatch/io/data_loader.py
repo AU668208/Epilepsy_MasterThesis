@@ -44,6 +44,11 @@ def correct_annotation_timestamp_np(anfalds_tidspunkt: np.datetime64) -> np.date
 def Load_full_ecg_data(patient_id: str):
     """
     Load full ECG signal + all seizure annotations for a patient.
+    Returs a dictionary with:
+        - "PatientID": patient_id
+        - "ECG": DataFrame with ECG signal and timestamps
+        - "Seizures": DataFrame with seizure annotations
+        - "SampleRate": Sampling rate of the ECG signal
     """
     import os
     import pandas as pd
@@ -86,7 +91,11 @@ def Load_full_ecg_data(patient_id: str):
 
     # Hele signalet → DataFrame
     step_ns = int(round(wf_increment * 1e9))
-    start_np = np.datetime64(wf_start, "ns")
+    
+    # parse wf_start som Python datetime (aware/naiv) → konvertér til naive-local
+    wf_start_dt = _to_local_naive(_to_datetime_safe(wf_start), prefer_tz="Europe/Copenhagen", assume_source_tz="UTC")
+    start_np = np.datetime64(wf_start_dt, "ns")
+
     timestamps = start_np + np.arange(len(signal)) * np.timedelta64(step_ns, "ns")
     ecg_df = pd.DataFrame({"Timestamp": timestamps, "Value": signal})
 

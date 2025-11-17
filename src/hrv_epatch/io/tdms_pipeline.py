@@ -269,12 +269,14 @@ def load_tdms(path: str, channel_hint: Optional[str] = None,
         fs = 512.0  # sensible default for your dataset
         warnings.warn("Could not read sampling frequency from TDMS; defaulting to fs=512 Hz.")
 
-    # --- Start time (correct to NAIVE local if requested) ---
     start_time = _extract_tdms_start_time(props_chain)
+    # --- Start time (correct to NAIVE local if requested) ---
+    if start_time is not None:
+        start_time = _to_local_naive(start_time, prefer_tz=prefer_tz, assume_source_tz=assume_source_tz)
 
     meta = RecordingMeta(
         fs=float(fs),
-        start_time=start_time,          # <— NAIVE local datetime if prefer_naive_local=True
+        start_time=start_time,
         n_samples=n_samples,
         channel_name=str(ch.name),
         units=units,
@@ -403,13 +405,16 @@ def align_annotations_to_samples(ann: pd.DataFrame, meta: RecordingMeta) -> pd.D
     if "offset_time" not in out.columns and "offset_rel_sec" in out.columns:
         out["offset_time"] = pd.to_datetime(meta.start_time) + pd.to_timedelta(out["offset_rel_sec"], unit="s")
 
-    # Localize times if naive
-    for col in ["onset_time", "offset_time"]:
+    def _to_local_naive_ts(ts):
+        if ts is pd.NaT: return ts
+        if ts.tz is not None:
+            return ts.tz_convert(tz_cph).tz_localize(None)
+        return ts  # naive = allerede lokal kl.
+
+    for col in ["onset_time","offset_time"]:
         if col in out.columns:
             out[col] = pd.to_datetime(out[col], errors="coerce")
-            # If naive, localize; if already tz-aware, leave as is
-            if getattr(out[col].dt.tz, 'zone', None) is None:
-                out[col] = out[col].dt.tz_localize(tz_cph, ambiguous="NaT", nonexistent="NaT")
+            out[col] = out[col].apply(_to_local_naive_ts)
 
     # Clamp to recording duration
     duration_sec = meta.n_samples / meta.fs

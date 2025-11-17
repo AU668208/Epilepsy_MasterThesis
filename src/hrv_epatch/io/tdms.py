@@ -96,7 +96,8 @@ def extract_tdms_channel(path: str, channel_hint: Optional[str] = None) -> Tuple
 
     if getattr(start_time, "tzinfo", None) is None:
         from dateutil import tz as _tz
-        start_time = start_time.replace(tzinfo=_tz.gettz("Europe/Copenhagen"))
+        # start_time = start_time.replace(tzinfo=_tz.gettz("Europe/Copenhagen"))
+        start_time = start_time.tz_convert("Europe/Copenhagen").tz_localize(None)
 
     meta = TdmsMeta(
         fs=float(fs),

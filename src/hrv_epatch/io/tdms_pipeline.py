@@ -28,6 +28,9 @@
 # - For TDMS, it will auto-pick the first channel if channel_hint is not provided.
 # - All plots use matplotlib with default styling (no specific colors set).
 
+from src.hrv_epatch.io.tdms import load_tdms_from_path, TdmsMeta
+
+
 from __future__ import annotations
 from typing import Optional, Tuple, Iterable, Dict, Any
 import re
@@ -176,113 +179,26 @@ def _extract_tdms_start_time(props_chain: list[Mapping[str, Any]]) -> Optional[d
 # ---------------------------
 # Public: refined loader using helpers
 # ---------------------------
-def load_tdms(path: str, channel_hint: Optional[str] = None,
-              prefer_tz: str = "Europe/Copenhagen",
-              assume_source_tz: Optional[str] = "UTC",
-              prefer_naive_local: bool = True) -> Tuple[np.ndarray, RecordingMeta]:
+def load_tdms(
+    path: str,
+    channel_hint: str | None = "EKG",
+    prefer_tz: str = "Europe/Copenhagen",
+    assume_source_tz: str | None = "UTC",
+    prefer_naive_local: bool = True,
+):
     """
-    Load a TDMS file and return (signal, metadata).
-
-    - Sampling frequency (fs) is inferred from common NI/nptdms properties.
-    - Start time is read from channel/group/file properties.
-    - If `prefer_naive_local` is True (default), `start_time` is returned as a NAIVE datetime
-      in the `prefer_tz` local clock (i.e., '11:05:02', not '09:05:02+02:00').
-      For naive inputs we assume the source timestamp is in `assume_source_tz` (default 'UTC').
-
-    Args:
-        path: Path to the TDMS file.
-        channel_hint: Optional substring to help pick the intended channel.
-        prefer_tz: IANA name of the intended local time zone (default Europe/Copenhagen).
-        assume_source_tz: If input start time is naive, interpret it as being in this tz (default 'UTC').
-        prefer_naive_local: If True, convert to `prefer_tz` and drop tzinfo (return naive).
-
-    Returns:
-        (signal: np.ndarray[float], meta: RecordingMeta)
+    Lille wrapper, så pipelinen bruger den kanoniske loader fra tdms.py.
+    Returnerer (signal, meta), hvor meta er TdmsMeta.
     """
-    if not NPTDMS_AVAILABLE:
-        raise ImportError("nptdms is not installed. Please `pip install nptdms`.")
-
-    tf = TdmsFile.read(path)
-
-    # --- Choose group and channel ---
-    groups = tf.groups()
-    if not groups:
-        raise ValueError("No groups found in TDMS.")
-    grp = groups[0]
-
-    channels = grp.channels()
-    if not channels:
-        # fall back to first channel across all groups
-        channels = [ch for g in tf.groups() for ch in g.channels()]
-        if not channels:
-            raise ValueError("No channels found in TDMS.")
-
-    ch = None
-    if channel_hint:
-        for c in channels:
-            if channel_hint.lower() in c.name.lower():
-                ch = c
-                break
-    if ch is None:
-        ch = channels[0]
-
-    # --- Read signal ---
-    data = np.asarray(ch[:], dtype=float)
-    n_samples = int(data.shape[0])
-
-    # --- Properties (channel -> group -> file) ---
-    ch_props   = getattr(ch, "properties", {}) or {}
-    grp_props  = getattr(grp, "properties", {}) or {}
-    file_props = getattr(tf, "properties", {}) or {}
-    props_chain = [ch_props, grp_props, file_props]
-
-    # --- Units ---
-    units = (
-        _first_present(ch_props, ["unit_string", "NI_UnitDescription", "unit"])
-        or None
+    signal, meta = load_tdms_from_path(
+        path,
+        channel_hint=channel_hint,
+        prefer_tz=prefer_tz,
+        assume_source_tz=assume_source_tz,
+        prefer_naive_local=prefer_naive_local,
     )
+    return signal, meta
 
-    # --- Sampling frequency ---
-    fs = None
-    wf_increment = _first_present(ch_props, ["wf_increment", "NI_wfIncrement"])
-    if wf_increment is not None:
-        try:
-            fs = 1.0 / float(wf_increment)
-        except Exception:
-            fs = None
-
-    if fs is None:
-        for key in ["fs", "sampling_frequency", "Sample Rate", "NI_SampleRate"]:
-            v = ch_props.get(key)
-            if v is None:
-                v = grp_props.get(key)
-            if v is None:
-                v = file_props.get(key)
-            if v is not None:
-                try:
-                    fs = float(v)
-                    break
-                except Exception:
-                    pass
-
-    if fs is None:
-        fs = 512.0  # sensible default for your dataset
-        warnings.warn("Could not read sampling frequency from TDMS; defaulting to fs=512 Hz.")
-
-    start_time = _extract_tdms_start_time(props_chain)
-    # --- Start time (correct to NAIVE local if requested) ---
-    if start_time is not None:
-        start_time = _to_local_naive(start_time, prefer_tz=prefer_tz, assume_source_tz=assume_source_tz)
-
-    meta = RecordingMeta(
-        fs=float(fs),
-        start_time=start_time,
-        n_samples=n_samples,
-        channel_name=str(ch.name),
-        units=units,
-        path=path,
-    )
-    return data, meta
 
 
 

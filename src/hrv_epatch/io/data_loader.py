@@ -1,114 +1,71 @@
 # DataLoader
-import numpy as np
+import os
+import pandas as pd
+
+from src.hrv_epatch.io.tdms import (
+    load_tdms_for_patient,
+    build_ecg_dataframe,
+    _find_base_dirs,   # ja, den er "privat", men det er fint internt i dit projekt
+)
 import matplotlib.pyplot as plt
 from datetime import timedelta
 import pandas as pd
 import os
 import random
-from nptdms import TdmsFile 
-
-# Convert fixed Python datetime lists to np.datetime64
-summertime_np = np.array([
-    "2010-03-28T02:00", "2011-03-27T02:00", "2012-03-25T02:00", "2013-03-31T02:00", "2014-03-30T02:00",
-    "2015-03-29T02:00", "2016-03-27T02:00", "2017-03-26T02:00", "2018-03-25T02:00", "2019-03-31T02:00",
-    "2020-03-29T02:00", "2021-03-28T02:00", "2022-03-27T02:00", "2023-03-26T02:00", "2024-03-31T02:00"
-], dtype='datetime64[m]')
-
-wintertime_np = np.array([
-    "2010-10-31T03:00", "2011-10-30T03:00", "2012-10-28T03:00", "2013-10-27T03:00", "2014-10-26T03:00",
-    "2015-10-25T03:00", "2016-10-30T03:00", "2017-10-29T03:00", "2018-10-28T03:00", "2019-10-27T03:00",
-    "2020-10-25T03:00", "2021-10-31T03:00", "2022-10-30T03:00", "2023-10-29T03:00", "2024-10-27T03:00"
-], dtype='datetime64[m]')
-
-def correct_annotation_timestamp_np(anfalds_tidspunkt: np.datetime64) -> np.datetime64:
-    """Return corrected timestamp for daylight saving time in np.datetime64 format."""
-    year = int(str(anfalds_tidspunkt)[:4])  # Extract year as int
-
-    # Find matching year index
-    idx = None
-    for i in range(len(summertime_np)):
-        if str(summertime_np[i])[:4] == str(year):
-            idx = i
-            break
-    if idx is None:
-        raise ValueError(f"Year {year} not found in summertime/wintertime lists.")
-
-    start_summer = summertime_np[idx]
-    start_winter = wintertime_np[idx]
-
-    if start_summer <= anfalds_tidspunkt < start_winter:
-        return anfalds_tidspunkt - np.timedelta64(2, 'h')  # Summer time: UTC+2
-    else:
-        return anfalds_tidspunkt - np.timedelta64(1, 'h')  # Winter time: UTC+1
     
-def Load_full_ecg_data(patient_id: str):
+DEFAULT_BASE_DIR = r"E:\ML algoritme tl anfaldsdetektion vha HRV\ePatch data from Aarhus to Lausanne"
+
+def Load_full_ecg_data(patient_id: str, base_dir: str = DEFAULT_BASE_DIR):
     """
-    Load full ECG signal + all seizure annotations for a patient.
-    Returs a dictionary with:
+    Load fuldt EKG-signal + alle seizure-annoteringer for en patient.
+
+    Returnerer en dict med:
         - "PatientID": patient_id
-        - "ECG": DataFrame with ECG signal and timestamps
-        - "Seizures": DataFrame with seizure annotations
-        - "SampleRate": Sampling rate of the ECG signal
+        - "ECG": DataFrame med ECG-signal og tidsakse
+        - "Seizures": DataFrame med seizure-annoteringer (kan være tom)
+        - "SampleRate": samplingfrekvens (float)
+        - "StartTime": start-tidspunkt (naiv lokal datetime)
+        - "TdmsPath": sti til den brugte TDMS-fil
     """
-    import os
-    import pandas as pd
-    import numpy as np
-    from nptdms import TdmsFile
-    base_dir = r"E:\ML algoritme tl anfaldsdetektion vha HRV\ePatch data from Aarhus to Lausanne"
-    #base_dir = r"D:\ML algoritme tl anfaldsdetektion vha HRV\ePatch data from Aarhus to Lausanne"
+    # 1) Find og load TDMS via fælles loader
+    signal, meta = load_tdms_for_patient(
+        patient_id=patient_id,
+        base_dir=base_dir,
+        channel_hint="EKG",
+        prefer_tz="Europe/Copenhagen",
+        assume_source_tz="UTC",     # sæt evt. til None, hvis wf_start_time allerede er lokal tid
+        prefer_naive_local=True,
+    )
 
-    # Find mapper
-    folder_top = os.listdir(base_dir)
-    seizure_log_dir = os.path.join(base_dir, folder_top[8])
-    data_dir = os.path.join(base_dir, folder_top[7])
+    fs = float(meta.fs)
 
-    # Find patientens mappe
-    patient_path = os.path.join(data_dir, patient_id)
-    subfolders = [
-        f for f in os.listdir(patient_path)
-        if any(k in f.lower() for k in ["enrollment", "recording"])
-    ]
-    session_path = os.path.join(patient_path, subfolders[0])
-    files = os.listdir(session_path)
+    # 2) Byg EKG-DataFrame med tidsakse
+    ecg_df = build_ecg_dataframe(signal, meta)
 
-    tdms_file = next((os.path.join(session_path, f) for f in files if f.endswith(".tdms")), None)
-    index_file = next((os.path.join(session_path, f) for f in files if "tdms_index" in f), None)
+    # 3) Find og læs seizure-log (hvis den findes)
+    data_dir, seizure_log_dir = _find_base_dirs(base_dir)
+    seizure_df = pd.DataFrame()  # tom fallback
 
-    # Læs meta-info
-    with TdmsFile.open(index_file) as index_tdms:
-        info = pd.DataFrame()
-        for group in index_tdms.groups():
-            for channel in group.channels():
-                for prop, val in channel.properties.items():
-                    info.loc[prop, "Value"] = val
-
-    tdms_data = TdmsFile.read(tdms_file)
-    signal = tdms_data.groups()[0].channels()[0].data
-
-    wf_start = info.loc["wf_start_time", "Value"]
-    wf_increment = info.loc["wf_increment", "Value"]
-    sample_rate = int(1 / wf_increment)
-
-    # Hele signalet → DataFrame
-    step_ns = int(round(wf_increment * 1e9))
-    
-    # parse wf_start som Python datetime (aware/naiv) → konvertér til naive-local
-    wf_start_dt = _to_local_naive(_to_datetime_safe(wf_start), prefer_tz="Europe/Copenhagen", assume_source_tz="UTC")
-    start_np = np.datetime64(wf_start_dt, "ns")
-
-    timestamps = start_np + np.arange(len(signal)) * np.timedelta64(step_ns, "ns")
-    ecg_df = pd.DataFrame({"Timestamp": timestamps, "Value": signal})
-
-    # Indlæs alle anfaldsannoteringer
-    seizure_log_file = next((os.path.join(seizure_log_dir, f) for f in os.listdir(seizure_log_dir) if patient_id in f), None)
-    seizure_df = pd.read_excel(seizure_log_file, skiprows=5)
-    seizure_df.columns = seizure_df.iloc[0]
-    seizure_df = seizure_df[1:].reset_index(drop=True)
+    if seizure_log_dir is not None and os.path.isdir(seizure_log_dir):
+        # Find en Excel-fil i seizure-log-mappen, der matcher patient_id i filnavnet
+        cand = [
+            f for f in os.listdir(seizure_log_dir)
+            if patient_id in f and f.lower().endswith((".xls", ".xlsx"))
+        ]
+        if cand:
+            seizure_log_file = os.path.join(seizure_log_dir, cand[0])
+            # Her kan du tilpasse skiprows/kolonner til din log-struktur
+            raw = pd.read_excel(seizure_log_file, skiprows=5)
+            raw.columns = raw.iloc[0]
+            seizure_df = raw[1:].reset_index(drop=True)
 
     return {
         "PatientID": patient_id,
         "ECG": ecg_df,
         "Seizures": seizure_df,
-        "SampleRate": sample_rate
+        "SampleRate": fs,
+        "StartTime": meta.start_time,
+        "TdmsPath": meta.path,
     }
+
 

@@ -1,0 +1,96 @@
+# -------------------------
+# Python cache & artifacts
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.pkl
+*.pickle
+*.pkl.gz
+
+# Cython build artifacts
+*.c
+*.so
+
+# -------------------------
+# Jupyter Notebook
+# -------------------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# -------------------------
+# Virtual environments
+# -------------------------
+venv/
+.env/
+.venv/
+env/
+ENV/
+
+# pipenv
+Pipfile.lock
+
+# -------------------------
+# PyCharm / VSCode / Editors
+# -------------------------
+.idea/
+.vscode/
+*.code-workspace
+
+# -------------------------
+# Operating system files
+# -------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Project outputs
+# -------------------------
+*.log
+*.tmp
+*.temp
+*.bak
+
+# compiled data files
+*.parquet
+*.h5
+*.hdf5
+*.hdf
+*.db
+
+# -------------------------
+# Your project–specific ignores
+# -------------------------
+
+# large ECG/TDMS data (never commit raw signals)
+data/
+raw_data/
+exported/
+_analysis/
+output/
+plots/
+
+# Jupytext paired files (if not wanted)
+*.py~*
+
+# SQLite or small dev databases
+*.sqlite3
+*.sqlite
+
+# -------------------------
+# Build tools / packaging
+# -------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# -------------------------
+# Test outputs
+# -------------------------
+.coverage
+htmlcov/
+.cache/
+pytest_cache/

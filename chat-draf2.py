@@ -2,7 +2,7 @@
 # from src.hrv_epatch.io.tdms import extract_tdms_channel
 from src.hrv_epatch.io.data_loader import Load_full_ecg_data
 
-from __future__ import annotations
+# from __future__ import annotations
 
 import numpy as np
 import pandas as pd

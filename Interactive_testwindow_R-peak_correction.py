@@ -16,7 +16,7 @@ class SeizureEvent:
 
 
 # %%
-path_lvm = r"E:\ML algoritme tl anfaldsdetektion vha HRV\LabView-Results\Patient5_1-Res1.lvm"
+path_lvm = r"E:\ML algoritme tl anfaldsdetektion vha HRV\LabView-Results\Patient5_remove_s5_e5.lvm"
 rr_intervals_lv = read_labview_rr(path_lvm)
 starttime_lv = read_header_datetime_lvm(path_lvm)
 print(f"Read {len(rr_intervals_lv)} LabVIEW RR intervals from LVM.")
@@ -201,6 +201,8 @@ visualize_ecg_with_r_peaks(
 # %%
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
+import numpy as np
+
 def plot_with_offset(
     raw_signal: np.ndarray,
     cleaned_signal: np.ndarray,
@@ -208,45 +210,67 @@ def plot_with_offset(
     detected_r_peaks: np.ndarray,
     labview_r_peaks: np.ndarray,
     start_time: float,
-    duration: float
+    duration: float,
+    coarse_range_s: float = 10.0,
+    fine_range_s: float = 0.05
 ):
+    """
+    Interaktiv visualisering af ECG med to R-peak-serier og justerbart offset
+    mellem LabVIEW og ECG/NeuroKit.
+
+    - raw_signal, cleaned_signal: hele signalet (numpy arrays)
+    - fs: samplingfrekvens [Hz]
+    - detected_r_peaks: NeuroKit R-peak-indeks (samples, samme akse som ECG)
+    - labview_r_peaks: LabVIEW R-peak-indeks (i LabVIEW-akse, altså uden offset)
+    - start_time: vinduets start i sekunder (ECG-akse)
+    - duration: vinduesbredde i sekunder
+    """
+    # ---- ECG-vindue ----
     start_sample = int(start_time * fs)
     end_sample = int((start_time + duration) * fs)
 
-    # Extract the window of interest
     raw_window = raw_signal[start_sample:end_sample]
     cleaned_window = cleaned_signal[start_sample:end_sample]
     time_axis = np.arange(start_sample, end_sample) / fs
 
-    # Get R-peaks within the window
-    detected_r_peaks_window = detected_r_peaks[
+    # NeuroKit peaks i vindue (flyttes ikke af offset)
+    detected_window_idx = detected_r_peaks[
         (detected_r_peaks >= start_sample) & (detected_r_peaks < end_sample)
     ] - start_sample
-    labview_r_peaks_window = labview_r_peaks[
-        (labview_r_peaks >= start_sample) & (labview_r_peaks < end_sample)
-    ] - start_sample
 
-    # Create the figure and axis
+    # Helper: beregn LabVIEW-peaks i vindue for et givent offset (sekunder)
+    def compute_labview_indices(offset_s: float) -> np.ndarray:
+        shift_samples = int(round(offset_s * fs))
+        labview_shifted = labview_r_peaks + shift_samples  # flyt til ECG-akse
+        mask = (labview_shifted >= start_sample) & (labview_shifted < end_sample)
+        local_idx = labview_shifted[mask] - start_sample    # lokale indekser i vinduet
+        return local_idx
+
+    # Initialt offset = 0
+    init_offset = 0.0
+    labview_idx = compute_labview_indices(init_offset)
+
+    # ---- Figur og plots ----
     fig, ax = plt.subplots(figsize=(12, 6))
-    plt.subplots_adjust(bottom=0.25)
+    plt.subplots_adjust(bottom=0.25)  # plads til 2 sliders
 
-    # Plot the signals
+    # Signaler
     ax.plot(time_axis, raw_window, label="Raw ECG", color="gray", alpha=0.7)
     ax.plot(time_axis, cleaned_window, label="Cleaned ECG", color="blue", alpha=0.9)
 
-    # Plot NeuroKit2 R-peaks
-    nk_peaks_plot = ax.scatter(
-        time_axis[detected_r_peaks_window],
-        cleaned_window[detected_r_peaks_window],
+    # NeuroKit peaks
+    ax.scatter(
+        time_axis[detected_window_idx],
+        cleaned_window[detected_window_idx],
         color="orange",
         label="NeuroKit2 R-peaks",
         zorder=3,
     )
 
-    # Plot LabView R-peaks
-    labview_peaks_plot = ax.scatter(
-        time_axis[labview_r_peaks_window],
-        cleaned_window[labview_r_peaks_window],
+    # LabVIEW peaks (initialt)
+    labview_scatter = ax.scatter(
+        time_axis[labview_idx],
+        cleaned_window[labview_idx],
         color="green",
         label="LabView R-peaks",
         zorder=3,
@@ -258,28 +282,54 @@ def plot_with_offset(
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Add a slider for offset adjustment
-    ax_offset = plt.axes([0.25, 0.1, 0.65, 0.03])
-    offset_slider = Slider(ax_offset, "Offset (s)", -duration, duration, valinit=0.0, valstep=0.01)
+    # ---- Sliders: grov + fin offset ----
+    # grov offset (f.eks. ±2 sek)
+    ax_offset_coarse = plt.axes([0.25, 0.12, 0.65, 0.03])
+    slider_coarse = Slider(
+        ax=ax_offset_coarse,
+        label="Offset coarse (s)",
+        valmin=-coarse_range_s,
+        valmax=coarse_range_s,
+        valinit=0.0,
+        valstep=0.025,
+    )
+
+    # fin offset (f.eks. ±0.05 sek)
+    ax_offset_fine = plt.axes([0.25, 0.06, 0.65, 0.03])
+    slider_fine = Slider(
+        ax=ax_offset_fine,
+        label="Offset fine (s)",
+        valmin=-fine_range_s,
+        valmax=fine_range_s,
+        valinit=0.0,
+        valstep=0.001,
+    )
+
+    # tekst nederst der viser total offset
+    offset_text = fig.text(0.5, 0.01, f"Total offset: {init_offset:.4f} s",
+                           ha="center", va="bottom")
 
     def update(val):
-        offset = offset_slider.val
-        adjusted_labview_r_peaks = labview_r_peaks_window + int(offset * fs)
+        total_offset = slider_coarse.val + slider_fine.val
+        new_idx = compute_labview_indices(total_offset)
 
-        # Clamp indices to valid bounds
-        adjusted_labview_r_peaks = np.clip(adjusted_labview_r_peaks, 0, len(time_axis) - 1)
+        if len(new_idx) == 0:
+            # Ingen peaks i vindue -> tom scatter
+            labview_scatter.set_offsets(np.empty((0, 2)))
+        else:
+            labview_scatter.set_offsets(
+                np.c_[time_axis[new_idx], cleaned_window[new_idx]]
+            )
 
-        labview_peaks_plot.set_offsets(
-            np.c_[
-                time_axis[adjusted_labview_r_peaks],
-                cleaned_window[adjusted_labview_r_peaks],
-            ]
-        )
+        offset_text.set_text(f"Total offset: {total_offset:.4f} s")
         fig.canvas.draw_idle()
 
-    offset_slider.on_changed(update)
+    slider_coarse.on_changed(update)
+    slider_fine.on_changed(update)
 
     plt.show()
+
+
 
 # Example usage
 plot_with_offset(
@@ -288,6 +338,10 @@ plot_with_offset(
     fs=fs,
     detected_r_peaks=detected_r_peaks,
     labview_r_peaks=labview_r_peaks,
-    start_time=10000,  # Adjust the start time as needed
-    duration=10    # Adjust the duration as needed
+    start_time=10000,
+    duration=10,
+    coarse_range_s=10.0,
+    fine_range_s=0.05,
 )
+
+

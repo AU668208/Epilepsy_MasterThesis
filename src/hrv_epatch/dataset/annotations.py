@@ -13,58 +13,61 @@ from .naming import RecordingKey
 
 # ---------- Hjælper: robust parsing af tidsceller ----------
 
-def _parse_time_cell(date_cell, time_cell) -> pd.Timestamp:
+def _parse_time_only(cell):
     """
-    Kombinér en datocelle og en tidscelle til en pandas.Timestamp.
-    Returnerer pd.NaT hvis enten er missing eller ikke kan parses.
+    Parse a cell that contains ONLY a time-of-day (hh:mm:ss),
+    ignoring any date component that Excel may have added.
+    Returns a datetime.time or pd.NaT.
     """
-    if pd.isna(time_cell) or pd.isna(date_cell):
+    if pd.isna(cell):
         return pd.NaT
 
-    # --- PARS DATO KONSEKVENT SOM dd.mm.yy ---
-    if isinstance(date_cell, (pd.Timestamp, datetime.datetime, datetime.date)):
-        date_ts = pd.to_datetime(date_cell, errors="coerce")
-    else:
-        s = str(date_cell).strip()
-        date_ts = pd.to_datetime(s, format="%d.%m.%y", errors="coerce")
+    # Hvis det allerede er en time:
+    if isinstance(cell, datetime.time):
+        return cell
 
-    if pd.isna(date_ts):
-        return pd.NaT
+    # Hvis det er en fuld datetime -> ignorér dato, brug kun time-delen
+    if isinstance(cell, datetime.datetime):
+        return cell.time()
 
-    date_norm = date_ts.normalize()
+    # Excel kan gemme tid som fraktion af en dag (float)
+    if isinstance(cell, (int, float, np.integer, np.floating)):
+        # 0.0 = 00:00, 0.5 = 12:00, 1.0 = 24:00 (næste dag) osv.
+        try:
+            base = pd.Timestamp("1970-01-01")
+            t = base + pd.to_timedelta(float(cell), unit="D")
+            return t.time()
+        except Exception:
+            return pd.NaT
 
-    # resten af funktionen som før:
-    if isinstance(time_cell, (int, float, np.integer, np.floating)):
-        return date_norm + pd.to_timedelta(float(time_cell), unit="D")
-
-    if isinstance(time_cell, pd.Timestamp):
-        t = time_cell
-        return date_norm + pd.to_timedelta(t.hour, unit="h") \
-                         + pd.to_timedelta(t.minute, unit="m") \
-                         + pd.to_timedelta(t.second, unit="s") \
-                         + pd.to_timedelta(t.microsecond, unit="us")
-
-    if isinstance(time_cell, datetime.datetime):
-        t = time_cell
-        return date_norm + pd.to_timedelta(t.hour, unit="h") \
-                         + pd.to_timedelta(t.minute, unit="m") \
-                         + pd.to_timedelta(t.second, unit="s") \
-                         + pd.to_timedelta(t.microsecond, unit="us")
-
-    if isinstance(time_cell, datetime.time):
-        return datetime.datetime.combine(date_norm.date(), time_cell)
-
-    s = str(time_cell).strip()
+    # Fallback: parse streng som tid
+    s = str(cell).strip()
     if s == "" or s.lower() in {"nan", "none", "na"}:
         return pd.NaT
+
     parsed = pd.to_datetime(s, errors="coerce")
     if pd.isna(parsed):
         return pd.NaT
-    return date_norm + pd.to_timedelta(parsed.hour, unit="h") \
-                     + pd.to_timedelta(parsed.minute, unit="m") \
-                     + pd.to_timedelta(parsed.second, unit="s") \
-                     + pd.to_timedelta(parsed.microsecond, unit="us")
+    return parsed.time()
 
+
+def _combine_date_and_time(date_ts, time_val):
+    """
+    Kombinér en pd.Timestamp (dato, normaliseret til midnat) og en datetime.time
+    til en fuld Timestamp. Returnerer pd.NaT hvis enten mangler.
+    """
+    if pd.isna(date_ts) or pd.isna(time_val):
+        return pd.NaT
+
+    return pd.Timestamp(
+        year=date_ts.year,
+        month=date_ts.month,
+        day=date_ts.day,
+        hour=time_val.hour,
+        minute=time_val.minute,
+        second=time_val.second,
+        microsecond=time_val.microsecond,
+    )
 
 
 def _seconds_since_midnight(ts: pd.Timestamp) -> float:
@@ -115,45 +118,58 @@ def load_annotations(path: Path) -> pd.DataFrame:
     type_col   = find_col("Anfaldstype") or find_col("anfaldstype")
     other_col  = find_col("Evt. bemærkninger") or find_col("note") or find_col("other")
 
-    res = pd.DataFrame()
+    res = pd.DataFrame(index=df.index)
 
     # Seizure-nummer
-    res["seizure_number"] = df[num_col] if num_col else (df.index + 1)
+    if num_col:
+        res["seizure_number"] = df[num_col]
+    else:
+        res["seizure_number"] = df.index + 1
 
-    # Dato normaliseret til midnat
+    # Dato normaliseret til midnat (dd.mm.yy), med fallback
     if date_col:
-        res["date"] = pd.to_datetime(
-            df[date_col].astype(str).str.strip(),
+        raw_dates = df[date_col].astype(str).str.strip()
+        dates = pd.to_datetime(
+            raw_dates,
             format="%d.%m.%y",
             errors="coerce"
-        ).dt.normalize()
-
+        )
+        # fallback: mere tolerant parser med dayfirst=True for evt. afvigende formater
+        mask = dates.isna()
+        if mask.any():
+            dates[mask] = pd.to_datetime(
+                raw_dates[mask],
+                dayfirst=True,
+                errors="coerce",
+            )
+        res["date"] = dates.dt.normalize()
     else:
         res["date"] = pd.NaT
 
+    # Hjælpefunktion til at bygge fulde timestamps ud fra dato + tidskolonne
+    def _build_ts_column(time_col_name: Optional[str]) -> pd.Series:
+        if not time_col_name:
+            return pd.Series(pd.NaT, index=df.index)
+        times_only = df[time_col_name].apply(_parse_time_only)
+        return pd.Series(
+            [
+                _combine_date_and_time(d, t)
+                for d, t in zip(res["date"], times_only)
+            ],
+            index=df.index,
+        )
+
     # Kombinér dato + tidskolonner til fulde timestamps
-    res["start_clinic"] = df.apply(
-        lambda r: _parse_time_cell(r[date_col], r[s_clin_col]) if s_clin_col else pd.NaT,
-        axis=1,
-    )
-    res["start_eeg"] = df.apply(
-        lambda r: _parse_time_cell(r[date_col], r[s_eeg_col]) if s_eeg_col else pd.NaT,
-        axis=1,
-    )
-    res["end_clinic"] = df.apply(
-        lambda r: _parse_time_cell(r[date_col], r[e_clin_col]) if e_clin_col else pd.NaT,
-        axis=1,
-    )
-    res["end_eeg"] = df.apply(
-        lambda r: _parse_time_cell(r[date_col], r[e_eeg_col]) if e_eeg_col else pd.NaT,
-        axis=1,
-    )
+    res["start_clinic"] = _build_ts_column(s_clin_col)
+    res["start_eeg"]    = _build_ts_column(s_eeg_col)
+    res["end_clinic"]   = _build_ts_column(e_clin_col)
+    res["end_eeg"]      = _build_ts_column(e_eeg_col)
 
     # Type/other hvis tilgængelig
     res["seizure_type"] = df[type_col] if type_col else None
-    res["other"] = df[other_col] if other_col else None
+    res["other"]        = df[other_col] if other_col else None
 
-    # Sørg for at tidskolonner er rigtige datotider
+    # Sørg for at tidskolonner er rigtige datotider (Timestamp)
     time_cols = ["start_clinic", "start_eeg", "end_clinic", "end_eeg"]
     for c in time_cols:
         res[c] = pd.to_datetime(res[c], errors="coerce")
@@ -161,13 +177,12 @@ def load_annotations(path: Path) -> pd.DataFrame:
     # Hjælpekolonner til evt. statistikker
     for prefix in time_cols:
         res[f"{prefix}_seconds"] = res[prefix].apply(_seconds_since_midnight)
-        res[f"{prefix}_hour"] = res[prefix].dt.hour
+        res[f"{prefix}_hour"]    = res[prefix].dt.hour
 
     # Traceability
     res["source_file"] = path.name
 
     return res
-
 
 
 # ---------- Find korrekt annoteringsfil for en given recording ----------
@@ -180,17 +195,36 @@ def find_annotation_file(
     Find den rigtige .xls/.xlsx til (patient, enrollment).
 
     Eksempler:
-      Patient 38a -> 'patient 38a.xls'
-      Patient 5   -> 'patient 5.xls'
+      Patient 38a -> 'patient 38a.xls' eller 'Patient 38a.xlsx'
+      Patient 5   -> 'patient 5.xls'   eller 'Patient 5.xlsx'
     """
     candidates = []
+
+    exts = [".xls", ".xlsx"]
+
     if key.enrollment_id is not None:
-        candidates.append(annotations_root / f"patient {key.patient_id}{key.enrollment_id}.xls")
-        candidates.append(annotations_root / f"Patient {key.patient_id}{key.enrollment_id}.xls")
-    candidates.append(annotations_root / f"patient {key.patient_id}.xls")
-    candidates.append(annotations_root / f"Patient {key.patient_id}.xls")
+        enr = key.enrollment_id
+        for ext in exts:
+            candidates.append(annotations_root / f"patient {key.patient_id}{enr}{ext}")
+            candidates.append(annotations_root / f"Patient {key.patient_id}{enr}{ext}")
+
+    for ext in exts:
+        candidates.append(annotations_root / f"patient {key.patient_id}{ext}")
+        candidates.append(annotations_root / f"Patient {key.patient_id}{ext}")
 
     for c in candidates:
         if c.exists():
             return c
+
+    # ekstra fallback: glob i tilfælde af mærkelige mellemrum osv.
+    if key.enrollment_id is not None:
+        pattern = f"[Pp]atient {key.patient_id}{key.enrollment_id}.*"
+    else:
+        pattern = f"[Pp]atient {key.patient_id}.*"
+
+    glob_candidates = sorted(annotations_root.glob(pattern))
+    if glob_candidates:
+        return glob_candidates[0]
+
     return None
+

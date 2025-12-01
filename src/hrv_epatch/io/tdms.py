@@ -14,7 +14,7 @@ from nptdms import TdmsFile
 
 
 # ============================================================
-# Dataklasser
+# Dataclass for TDMS-metadata
 # ============================================================
 
 @dataclass
@@ -27,18 +27,18 @@ class TdmsMeta:
     path: Optional[str] = None
 
 
-# (Hvis du andre steder bruger RecordingMeta-navnet, kan du gøre:)
+# (If using RecordingMeta then can be done:)
 RecordingMeta = TdmsMeta
 
 
 # ============================================================
-# Helper-funktioner til tid
+# Helper-function for time
 # ============================================================
 
 def _to_datetime_safe(value: Any) -> Optional[datetime]:
     """
-    Forsøg at parse TDMS/NI property til en Python datetime.
-    Beholder evt. timezone-info hvis den er der.
+    Attempt to parse a TDMS/NI property to a Python datetime.
+    Retains timezone info if present.
     """
     if value is None:
         return None
@@ -73,12 +73,12 @@ def _to_local_naive(
     assume_source_tz: Optional[str] = "UTC",
 ) -> datetime:
     """
-    Konvertér en datetime til *lokal klokkeslæt* i `prefer_tz`, og drop tzinfo.
-    Regler:
-      - Hvis dt allerede er tz-aware: konvertér til prefer_tz -> returnér naive.
-      - Hvis dt er naive:
-          * Hvis assume_source_tz != None: tolkes som den tz, konvertér til prefer_tz -> naive.
-          * Hvis assume_source_tz == None: antages at være lokal klokkeslæt allerede -> returnér dt.
+    Convert a datetime to *local time* in `prefer_tz`, and drop tzinfo.
+    Rules:
+      - If dt is already tz-aware: convert to prefer_tz -> return naive.
+      - If dt is naive:
+          * If assume_source_tz != None: interpret as that tz, convert to prefer_tz -> naive.
+          * If assume_source_tz == None: assume it is already local time -> return dt.
     """
     if dt.tzinfo is not None:
         local = dt.astimezone(_tz.gettz(prefer_tz))
@@ -102,7 +102,7 @@ def _first_present(d: Dict[str, Any], keys: list[str]) -> Any:
 
 def _extract_tdms_start_time(props_chain: list[Dict[str, Any]]) -> Optional[datetime]:
     """
-    Søg efter en plausibel starttid i channel->group->file properties.
+    Search for a plausible start time in channel->group->file properties.
     """
     candidate_keys = [
         "wf_start_time",
@@ -124,7 +124,7 @@ def _extract_tdms_start_time(props_chain: list[Dict[str, Any]]) -> Optional[date
 
 
 # ============================================================
-# KANONISK LOADER: fra TDMS-path
+# LOADER: From TDMS-path
 # ============================================================
 
 def load_tdms_from_path(
@@ -135,27 +135,26 @@ def load_tdms_from_path(
     prefer_naive_local: bool = True,
 ) -> Tuple[np.ndarray, TdmsMeta]:
     """
-    Kanonisk TDMS-loader.
-    - Finder kanal (evt. baseret på channel_hint)
-    - Udregner fs (sampling frequency)
-    - Læser starttid fra TDMS-properties
-    - Korrigerer tid til NAIV lokal tid i `prefer_tz` (default Europe/Copenhagen)
-
+    TDMS loader.
+    - Finds channel (optionally based on channel_hint)
+    - Calculates fs (sampling frequency)
+    - Reads start time from TDMS properties
+    - Adjusts time to NAIVE local time in `prefer_tz` (default Europe/Copenhagen)
     Args
     ----
     path : str
-        Fuld sti til TDMS-filen.
+        Full path to the TDMS file.
     channel_hint : Optional[str]
-        Delstreng der skal matche kanalnavnet (fx 'EKG').
-        Hvis None -> første kanal bruges.
+        Substring to match the channel name (e.g., 'EKG').
+        If None -> first channel is used.
     prefer_tz : str
-        Lokal tidszone (IANA navn). Default "Europe/Copenhagen".
+        Local timezone (IANA name). Default "Europe/Copenhagen".
     assume_source_tz : Optional[str]
-        Hvis starttid i TDMS er naive: antag at den er i denne tz (fx 'UTC').
-        Hvis None: antag at den er lokal allerede.
+        If start time in TDMS is naive: assume it is in this timezone (e.g., 'UTC').
+        If None: assume it is already local.
     prefer_naive_local : bool
-        Hvis True: returnér start_time som naive lokal (uden tzinfo).
-        Hvis False: kan i fremtiden bruges til at returnere tz-aware, men pt. returneres stadig naive.
+        If True: return start_time as naive local (without tzinfo).
+        If False: can in the future be used to return tz-aware, but currently still returns naive.
 
     Returns
     -------
@@ -246,112 +245,18 @@ def load_tdms_from_path(
     )
     return data, meta
 
-
 # ============================================================
-# Loader: find TDMS-fil ud fra patient-ID
-# ============================================================
-
-def _find_base_dirs(base_dir: str) -> Tuple[str, Optional[str]]:
-    """
-    Find under-mapper for:
-      - data_dir: 'Patients ePatch data' (eller lign. navn)
-      - seizure_log_dir: 'Seizure log...' (hvis den findes)
-
-    Returnerer (data_dir, seizure_log_dir_or_None)
-    """
-    entries = os.listdir(base_dir)
-    data_dir = None
-    seizure_dir = None
-
-    for name in entries:
-        lower = name.lower()
-        full = os.path.join(base_dir, name)
-        if not os.path.isdir(full):
-            continue
-        if "patient" in lower and "epatch" in lower and "data" in lower:
-            data_dir = full
-        if "seizure" in lower and "log" in lower:
-            seizure_dir = full
-
-    if data_dir is None:
-        raise RuntimeError(f"Could not locate 'Patients ePatch data' folder under {base_dir}")
-
-    return data_dir, seizure_dir
-
-
-def _find_patient_tdms_path(
-    patient_id: str,
-    base_dir: str,
-) -> str:
-    """
-    Find TDMS-fil for en patient ud fra mappestrukturen:
-      base_dir/
-        ... 'Patients ePatch data'/Patient {id}/[enrollment|recording].../*.tdms
-    """
-    data_dir, _ = _find_base_dirs(base_dir)
-    patient_path = os.path.join(data_dir, patient_id)
-    if not os.path.isdir(patient_path):
-        raise FileNotFoundError(f"Patient folder not found: {patient_path}")
-
-    subfolders = [
-        f
-        for f in os.listdir(patient_path)
-        if any(k in f.lower() for k in ["enrollment", "recording"])
-    ]
-    if not subfolders:
-        raise FileNotFoundError(f"No enrollment/recording folder found under {patient_path}")
-
-    # Vælg første (eller sortér, hvis du vil være deterministisk)
-    subfolders.sort()
-    session_path = os.path.join(patient_path, subfolders[0])
-
-    files = os.listdir(session_path)
-    tdms_file = next((os.path.join(session_path, f) for f in files if f.lower().endswith(".tdms")), None)
-    if tdms_file is None:
-        raise FileNotFoundError(f"No .tdms file found in session folder {session_path}")
-
-    return tdms_file
-
-
-def load_tdms_for_patient(
-    patient_id: str,
-    base_dir: str,
-    channel_hint: Optional[str] = "EKG",
-    prefer_tz: str = "Europe/Copenhagen",
-    assume_source_tz: Optional[str] = "UTC",
-    prefer_naive_local: bool = True,
-) -> Tuple[np.ndarray, TdmsMeta]:
-    """
-    Find TDMS-fil for patienten og kald den kanoniske loader.
-
-    Eksempel:
-        sig, meta = load_tdms_for_patient(
-            "Patient 5",
-            base_dir=r"E:\\ML algoritme tl anfaldsdetektion vha HRV\\ePatch data from Aarhus to Lausanne",
-        )
-    """
-    tdms_path = _find_patient_tdms_path(patient_id, base_dir)
-    return load_tdms_from_path(
-        tdms_path,
-        channel_hint=channel_hint,
-        prefer_tz=prefer_tz,
-        assume_source_tz=assume_source_tz,
-        prefer_naive_local=prefer_naive_local,
-    )
-
-
-# ============================================================
-# (Valgfri) helper: timestamps som Pandas DataFrame
+# (Optional) helper: timestamps as Pandas DataFrame
 # ============================================================
 
 def build_ecg_dataframe(signal: np.ndarray, meta: TdmsMeta) -> pd.DataFrame:
     """
-    Byg et DataFrame med tidsakse ud fra meta.start_time + fs.
-    Hvis start_time er None, laves en simpel index-baseret tidsakse i sekunder.
+    Build a DataFrame with time axis from meta.start_time + fs.
+    If start_time is None, a simple index-based time axis in seconds is created.
     """
     N = len(signal)
     if meta.start_time is not None:
-        # tidsakse i ns
+        # time axis in ns
         step_ns = int(round(1.0 / meta.fs * 1e9))
         start_np = np.datetime64(meta.start_time, "ns")
         timestamps = start_np + np.arange(N) * np.timedelta64(step_ns, "ns")

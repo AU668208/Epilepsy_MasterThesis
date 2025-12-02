@@ -1,5 +1,3 @@
-# hrv_epatch/plots/peri_sqi.py
-
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Optional, List

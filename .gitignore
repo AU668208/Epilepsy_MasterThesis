@@ -70,7 +70,6 @@ raw_data/
 exported/
 _analysis/
 output/
-plots/
 
 # Jupytext paired files (if not wanted)
 *.py~*

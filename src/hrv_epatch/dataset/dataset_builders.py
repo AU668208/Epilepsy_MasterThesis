@@ -127,8 +127,8 @@ def build_df_rec_and_df_evt(tdms_root: Path,
         
         if test_mode:
             test_count += 1
-            if test_count >= 5:
-                print("[INFO] Test mode active - stopping after 5 recordings.")
+            if test_count >= 2:
+                print("[INFO] Test mode active - stopping after 2 recordings.")
                 break
 
     df_rec = pd.DataFrame(rec_rows).sort_values(

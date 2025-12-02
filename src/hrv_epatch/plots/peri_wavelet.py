@@ -37,26 +37,19 @@ def plot_cwt(ecg, fs, title="", cmap="viridis", vmin=None, vmax=None):
 
 
 def plot_peri_cwt_triplet(df_peri, fs, patient_id, seizure_id,
-                          figsize=(14, 10), save_path=None):
-    """
-    Plot baseline_near, ictal, and post_near CWT heatmaps for a given seizure.
+                          figsize=(14, 10), save_path=None, show_plot=True):
 
-    df_peri must contain:
-        recording_uid, patient_id, seizure_id, role, signal
-    """
-    # Extract 3 windows
+    # Extract peri segments
     win_baseline = df_peri[
         (df_peri.patient_id == patient_id) &
         (df_peri.seizure_id == seizure_id) &
         (df_peri.role == "baseline_near")
     ]
-
     win_ictal = df_peri[
         (df_peri.patient_id == patient_id) &
         (df_peri.seizure_id == seizure_id) &
         (df_peri.role == "ictal")
     ]
-
     win_post = df_peri[
         (df_peri.patient_id == patient_id) &
         (df_peri.seizure_id == seizure_id) &
@@ -64,13 +57,13 @@ def plot_peri_cwt_triplet(df_peri, fs, patient_id, seizure_id,
     ]
 
     if len(win_baseline)==0 or len(win_ictal)==0 or len(win_post)==0:
-        raise ValueError("Missing one or more peri-ictal windows for this patient/seizure.")
+        raise ValueError("Missing one or more peri-ictal windows.")
 
     ecg_base = win_baseline.iloc[0]["signal"]
     ecg_ict  = win_ictal.iloc[0]["signal"]
     ecg_post = win_post.iloc[0]["signal"]
 
-    plt.figure(figsize=figsize)
+    fig = plt.figure(figsize=figsize)
 
     # Panel 1: baseline
     plt.subplot(3,1,1)
@@ -87,7 +80,13 @@ def plot_peri_cwt_triplet(df_peri, fs, patient_id, seizure_id,
     plt.tight_layout()
 
     if save_path is not None:
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
 
-    plt.show()
+    plt.close(fig)  # <-- prevents showing ANYTHING
+
+    if show_plot:
+        fig.show()
+
+    return fig
+
 

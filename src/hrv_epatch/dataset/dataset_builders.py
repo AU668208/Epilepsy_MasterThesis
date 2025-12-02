@@ -25,7 +25,8 @@ def build_df_rec_and_df_evt(tdms_root: Path,
                             channel_hint: str = "EKG",
                             prefer_tz: str = "Europe/Copenhagen",
                             assume_source_tz: str = "UTC",
-                            prefer_naive_local: bool = True):
+                            prefer_naive_local: bool = True,
+                            test_mode: bool = False):
     """
     Main builder function for Study 3.
     Returns:
@@ -38,6 +39,7 @@ def build_df_rec_and_df_evt(tdms_root: Path,
 
     rec_rows = []
     evt_rows = []
+    test_count = 0
 
     # 2) Loop through all recordings
     for entry in entries:
@@ -122,6 +124,12 @@ def build_df_rec_and_df_evt(tdms_root: Path,
                 "absolute_start": abs_start,
                 "absolute_end": abs_end,
             })
+        
+        if test_mode:
+            test_count += 1
+            if test_count >= 5:
+                print("[INFO] Test mode active - stopping after 5 recordings.")
+                break
 
     df_rec = pd.DataFrame(rec_rows).sort_values(
         ["patient_id", "enrollment_id", "recording_id"]

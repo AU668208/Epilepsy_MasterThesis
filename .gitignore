@@ -71,9 +71,6 @@ exported/
 _analysis/
 output/
 
-# Jupytext paired files (if not wanted)
-*.py~*
-
 # SQLite or small dev databases
 *.sqlite3
 *.sqlite

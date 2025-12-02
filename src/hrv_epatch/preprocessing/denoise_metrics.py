@@ -5,11 +5,37 @@ from scipy.signal import welch, iirnotch, filtfilt, butter
 
 # ---------- PSD / bandpower ----------
 def _psd(sig, fs, nperseg=None, overlap=0.5):
+    sig = np.asarray(sig)
+
+    # default vindueslængde ~8 sekunder
     if nperseg is None:
-        nperseg = int(8*fs)
-    noverlap = int(nperseg*overlap)
-    f, Pxx = welch(sig, fs=fs, nperseg=nperseg, noverlap=noverlap, detrend='constant')
+        nperseg = int(8 * fs)
+
+    # cap nperseg til signalets længde
+    nperseg = min(nperseg, len(sig))
+
+    # hvis signalet er meget kort, giver PSD ikke rigtig mening
+    if nperseg < 4:
+        # fald tilbage til noget helt simpelt: 1 frekvens-bin
+        f = np.array([0.0])
+        Pxx = np.array([0.0])
+        return f, Pxx
+
+    noverlap = int(nperseg * overlap)
+
+    # sørg for at noverlap < nperseg
+    if noverlap >= nperseg:
+        noverlap = nperseg - 1
+
+    f, Pxx = welch(
+        sig,
+        fs=fs,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        detrend="constant",
+    )
     return f, Pxx
+
 
 def _bandpower(f, Pxx, f1, f2):
     m = (f >= f1) & (f <= f2)

@@ -5,16 +5,40 @@ import matplotlib.pyplot as plt
 from scipy.signal import welch, stft, find_peaks
 
 # ---------- Welch PSD ----------
-def compute_psd(sig, fs, nperseg=None, overlap=0.5, detrend='constant'):
+def compute_psd(sig, fs, nperseg=None, overlap=0.5, detrend="constant"):
     """
-    Beregn PSD med Welch. Returnerer (f, Pxx).
-    nperseg ~ 8 s vinduer som default.
+    Robust PSD-beregning med welch, der fungerer også for korte segmenter.
     """
+    sig = np.asarray(sig)
+
+    # standard: ~8 sekunders vindue
     if nperseg is None:
-        nperseg = int(8*fs)
-    noverlap = int(nperseg*overlap)
-    f, Pxx = welch(sig, fs=fs, nperseg=nperseg, noverlap=noverlap, detrend=detrend)
+        nperseg = int(8 * fs)
+
+    # cap nperseg til signalets længde
+    nperseg = min(nperseg, len(sig))
+
+    # hvis signalet er ekstremt kort, giver PSD ikke mening
+    if nperseg < 4:
+        f = np.array([0.0])
+        Pxx = np.array([0.0])
+        return f, Pxx
+
+    noverlap = int(nperseg * overlap)
+
+    # sørg for at noverlap < nperseg
+    if noverlap >= nperseg:
+        noverlap = nperseg - 1
+
+    f, Pxx = welch(
+        sig,
+        fs=fs,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        detrend=detrend,
+    )
     return f, Pxx
+
 
 def plot_psd(sig, fs, fmax=None, line_freq=50.0, harmonics=4, annotate=True):
     """

@@ -297,10 +297,10 @@ def plot_ecg_window_with_algorithms(
     fs: float,
     center_s: float,
     window_s: float,
-    peaks_alg1: np.ndarray,
-    peaks_alg2: np.ndarray,
-    label_alg1: str = "Algoritme 1",
-    label_alg2: str = "Algoritme 2",
+    peaks_alg1: Optional[np.ndarray] = None,
+    peaks_alg2: Optional[np.ndarray] = None,
+    label_alg1: Optional[str] = None,
+    label_alg2: Optional[str] = None,
     cleaned_ecg: Optional[np.ndarray] = None,
     big_time: float = 0.20,
     small_time: float = 0.04,
@@ -315,58 +315,53 @@ def plot_ecg_window_with_algorithms(
     save_path: Optional[str] = None,
     show: bool = True,
     return_fig: bool = False,
-    sample_id: Optional[str] = None,  # <--- NYT
+    sample_id: Optional[str] = None,
 ):
     """
-    Plot et EKG-udsnit på grid med to algoritmers R-peaks.
+    Plot an ECG window on grid with optional R-peaks from two algorithms.
 
-    peaks_alg1/2 er sample-indekser i deres egen tidsakse.
-    offset_alg1_s/offset_alg2_s kan bruges til at flytte peaks horisontalt,
-    så de aligner med ecg-signalet (positiv værdi = senere i tid).
+    peaks_alg1/2 are sample indices in their own time axis (optional).
+    offset_alg1_s/offset_alg2_s shift peaks horizontally to align with ecg signal.
     """
 
-    # ---- justér peaks for evt. offset (uden at ændre original-arrays) ----
-    shift1 = int(round(offset_alg1_s * fs))
-    shift2 = int(round(offset_alg2_s * fs))
-    peaks1 = np.asarray(peaks_alg1, dtype=int) + shift1
-    peaks2 = np.asarray(peaks_alg2, dtype=int) + shift2
+    # Apply offsets only if peaks are provided
+    peaks1 = None
+    peaks2 = None
+    if peaks_alg1 is not None:
+        shift1 = int(round(offset_alg1_s * fs))
+        peaks1 = np.asarray(peaks_alg1, dtype=int) + shift1
+    if peaks_alg2 is not None:
+        shift2 = int(round(offset_alg2_s * fs))
+        peaks2 = np.asarray(peaks_alg2, dtype=int) + shift2
 
     center_sample = int(round(center_s * fs))
     half_win = int(round(window_s * fs))
     lo = max(0, center_sample - half_win)
     hi = min(len(ecg), center_sample + half_win)
 
-    # Absolut tid eller relativ tid fra vinduets start
     if show_absolute_time:
         t = np.arange(lo, hi) / fs
     else:
-        t = (np.arange(lo, hi) - lo) / fs   # 0 → window_s*2
+        t = (np.arange(lo, hi) - lo) / fs
 
     seg = ecg[lo:hi]
 
     if units_per_mV is not None:
-        # Fast EKG-lignende skala:
-        # center omkring median (så baseline wander ikke “flytter” vinduet)
         y_center = float(np.median(seg))
-        half_span = units_per_mV * mv_range     # fx 2.0 mV → ±2 mV
+        half_span = units_per_mV * mv_range
         y_min = y_center - half_span
         y_max = y_center + half_span
-
-        # 0.5 mV per stor rude, 0.1 mV per lille rude
         big_amp = units_per_mV * 0.5
         small_amp = units_per_mV * 0.1
     else:
-        # gammel auto-skalering
         y_min = float(seg.min())
         y_max = float(seg.max())
         y_pad = 0.1 * (y_max - y_min) if y_max > y_min else 1.0
         y_min -= y_pad
         y_max += y_pad
 
-
     fig, ax = plt.subplots(figsize=(14, 3.5))
 
-    # Grid først
     add_ecg_grid(
         ax,
         t_start=t[0],
@@ -377,56 +372,47 @@ def plot_ecg_window_with_algorithms(
         small_time=small_time,
         big_amp=big_amp,
         small_amp=small_amp,
-        label_step_s=label_step_s,   # ny parameter, se nedenfor
+        label_step_s=label_step_s,
     )
 
-    # selve signalet
     ax.plot(t, seg, color="black", linewidth=1.0, label="ECG")
 
     if cleaned_ecg is not None:
         seg_clean = cleaned_ecg[lo:hi]
         ax.plot(t, seg_clean, color="gray", linewidth=0.8, alpha=0.7, label="Cleaned ECG")
 
-    # Algoritme 1 – blå cirkel
-    p1 = peaks1[(peaks1 >= lo) & (peaks1 < hi)]
-    if len(p1) > 0:
-        if show_absolute_time:
-            x1 = p1 / fs
-        else:
-            x1 = (p1 - lo) / fs   # relativ tid
+    # Algorithm 1 peaks (optional)
+    if peaks1 is not None and label_alg1 is not None:
+        p1 = peaks1[(peaks1 >= lo) & (peaks1 < hi)]
+        if len(p1) > 0:
+            x1 = p1 / fs if show_absolute_time else (p1 - lo) / fs
+            ax.scatter(
+                x1,
+                ecg[p1],
+                s=90,
+                marker="o",
+                facecolors="cyan",
+                edgecolors="black",
+                linewidths=1.5,
+                zorder=6,
+                label=label_alg1,
+            )
 
-        ax.scatter(
-            x1,
-            ecg[p1],
-            s=90,
-            marker="o",
-            facecolors="cyan",
-            edgecolors="black",
-            linewidths=1.5,
-            zorder=6,
-            label=label_alg1,
-        )
-
-    # Algoritme 2 – orange kryds
-    p2 = peaks2[(peaks2 >= lo) & (peaks2 < hi)]
-    if len(p2) > 0:
-        if show_absolute_time:
-            x2 = p2 / fs
-        else:
-            x2 = (p2 - lo) / fs
-
-        ax.scatter(
-            x2,
-            ecg[p2],
-            s=110,
-            marker="x",
-            color="orange",
-            linewidths=2.0,
-            zorder=7,
-            label=label_alg2,
-        )
-
-
+    # Algorithm 2 peaks (optional)
+    if peaks2 is not None and label_alg2 is not None:
+        p2 = peaks2[(peaks2 >= lo) & (peaks2 < hi)]
+        if len(p2) > 0:
+            x2 = p2 / fs if show_absolute_time else (p2 - lo) / fs
+            ax.scatter(
+                x2,
+                ecg[p2],
+                s=110,
+                marker="x",
+                color="orange",
+                linewidths=2.0,
+                zorder=7,
+                label=label_alg2,
+            )
 
     ax.set_xlabel("Tid [s]")
     ax.set_ylabel("Amplitude")
@@ -436,17 +422,16 @@ def plot_ecg_window_with_algorithms(
         title = f"ECG-udsnit (0–{2*window_s:.1f} s)"
 
     if sample_id is not None:
-        title = f"{title} – {sample_id}"   # <-- TILFØJ SAMPLE-ID
+        title = f"{title} – {sample_id}"
 
     ax.set_title(title)
 
     leg = ax.legend(
-        loc="lower right",        # <-- NY PLACERING
+        loc="lower right",
         frameon=True,
         fontsize=10,
     )
 
-    # Gør baggrunden let transparent så signalet kan ses igennem
     leg.get_frame().set_alpha(0.85)
     leg.get_frame().set_facecolor("white")
     leg.get_frame().set_edgecolor("black")
@@ -456,15 +441,12 @@ def plot_ecg_window_with_algorithms(
     if save_path is not None:
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
 
-    # Interaktiv visning
     if show:
         plt.show()
 
-    # Håndtering af fig-livscyklus
     if return_fig:
         return fig
     else:
-        # Vi er færdige med figuren her
         plt.close(fig)
         return None
 

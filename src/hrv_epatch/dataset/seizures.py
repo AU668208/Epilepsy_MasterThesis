@@ -11,6 +11,10 @@ class SeizureEvent:
     seizure_id: int
     t0: float  # seconds from recording start
     t1: float  # seconds from recording start
+    t0_video: float | None = None
+    t1_video: float | None = None
+    t0_clinical: float | None = None
+    t1_clinical: float | None = None
 
 
 def build_seizure_events_from_df(
@@ -74,6 +78,10 @@ def build_seizure_events_from_df(
                 seizure_id=seiz_id,
                 t0=float(t0),
                 t1=float(t1),
+                t0_video=(s_abs - rec_start).total_seconds() if pd.notna(s_abs) else None,
+                t1_video=(e_abs - rec_start).total_seconds() if pd.notna(e_abs) else None,
+                t0_clinical=(start_cl - rec_start).total_seconds() if pd.notna(start_cl) else None,
+                t1_clinical=(end_cl - rec_start).total_seconds() if pd.notna(end_cl) else None,
             )
         )
 

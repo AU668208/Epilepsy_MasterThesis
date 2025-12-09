@@ -84,6 +84,46 @@ def compute_within_recording_isi(df_evt: pd.DataFrame):
 
     return isi
 
+def compute_isi_per_patient(df_evt: pd.DataFrame) -> pd.DataFrame:
+    """
+    Beregn inter-seizure intervals (ISI) indenfor samme recording_uid,
+    men gem dem per patient og recording.
+
+    Returnerer DataFrame med kolonner:
+        - patient_id
+        - recording_id
+        - recording_uid
+        - isi_seconds
+        - isi_hours
+    """
+    rows = []
+
+    # groupby på både patient og recording_uid for overblik
+    for (pid, rid, uid), df_r in df_evt.groupby(["patient_id", "recording_id", "recording_uid"]):
+        df_r_sorted = df_r.sort_values("absolute_start")
+        if len(df_r_sorted) < 2:
+            continue
+
+        intervals = (
+            df_r_sorted["absolute_start"]
+            .diff()
+            .dt.total_seconds()
+            .dropna()
+        )
+
+        for val in intervals.values:
+            rows.append(
+                {
+                    "patient_id": pid,
+                    "recording_id": rid,
+                    "recording_uid": uid,
+                    "isi_seconds": float(val),
+                    "isi_hours": float(val) / 3600.0,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
 def compute_dataset_overview(df_rec: pd.DataFrame,
                              df_evt: pd.DataFrame) -> pd.DataFrame:
     """
@@ -148,3 +188,27 @@ def summarise_isi(isi: list[float]) -> pd.DataFrame:
         ],
     }
     return pd.DataFrame(stats)
+
+def summarise_isi_per_patient(df_isi: pd.DataFrame) -> pd.DataFrame:
+    """
+    Lav en tabel med ISI-statistik per patient.
+    """
+    if df_isi.empty:
+        return pd.DataFrame()
+
+    grp = df_isi.groupby("patient_id")["isi_seconds"]
+
+    df_stats = grp.agg(
+        n_intervals="count",
+        mean_s="mean",
+        median_s="median",
+        iqr_s=lambda x: np.nanpercentile(x, 75) - np.nanpercentile(x, 25),
+        min_s="min",
+        max_s="max",
+    ).reset_index()
+
+    # Konverter til timer også
+    for col in ["mean_s", "median_s", "iqr_s", "min_s", "max_s"]:
+        df_stats[col.replace("_s", "_h")] = df_stats[col] / 3600.0
+
+    return df_stats

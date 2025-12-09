@@ -2,81 +2,68 @@ import numpy as np
 import pandas as pd
 
 
-def build_segment_index(df_rec: pd.DataFrame,
-                        df_evt: pd.DataFrame,
-                        window_s: int = 60) -> pd.DataFrame:
+def build_segment_index(
+    df_rec: pd.DataFrame,
+    df_evt: pd.DataFrame,
+    window_s: float = 60.0,
+    seizure_buffer_s: float = 0.0,
+    label_extended: bool = False,
+):
     """
-    Bygger et segment-index for hele datasættet.
-    Hver recording opdeles i ikke-overlappende vinduer på window_s sekunder,
-    som labeles som 'seizure' hvis de overlapper et anfald, ellers 'baseline'.
+    Build segment index combining recordings and seizures.
+    Optionally expand seizure intervals by ± buffer seconds.
 
-    Returnerer:
-        DataFrame med kolonner:
-            - segment_id (løbenummer)
-            - patient_id
-            - enrollment_id
-            - recording_uid
-            - segment_start (datetime)
-            - segment_end   (datetime)
-            - label ('seizure' / 'baseline')
+    Returns
+    -------
+    DataFrame with:
+    - patient_id
+    - recording_uid
+    - win_start_s, win_end_s
+    - context: baseline / seizure_core / seizure_extended
     """
 
     rows = []
-    seg_id = 0
-
-    # sørg for datetime
-    df_rec = df_rec.copy()
-    df_rec["recording_start"] = pd.to_datetime(df_rec["recording_start"])
-    df_rec["recording_end"] = pd.to_datetime(df_rec["recording_end"])
-
-    df_evt = df_evt.copy()
-    df_evt["absolute_start"] = pd.to_datetime(df_evt["absolute_start"])
-    df_evt["absolute_end"] = pd.to_datetime(df_evt["absolute_end"])
-
-    win = pd.to_timedelta(window_s, unit="s")
 
     for _, rec in df_rec.iterrows():
-        rid = rec["recording_uid"]
-        pid = rec["patient_id"]
-        enr = rec.get("enrollment_id", "")
+        uid = rec["recording_uid"]
+        rec_start = rec["recording_start"]
+        rec_end   = rec["recording_end"]
+        rec_dur_s = (rec_end - rec_start).total_seconds()
 
-        start = rec["recording_start"]
-        end = rec["recording_end"]
+        # Find relevant seizures for this recording
+        evts = df_evt[df_evt["recording_uid"] == uid]
 
-        # events tilhørende denne recording
-        ev_rec = df_evt[df_evt["recording_uid"] == rid]
+        # Build windows
+        n_windows = int(rec_dur_s // window_s)
+        for w in range(n_windows):
+            w0 = w * window_s
+            w1 = w0 + window_s
 
-        # antal vinduer
-        total_s = (end - start).total_seconds()
-        n_win = int(np.floor(total_s / window_s))
-        if n_win <= 0:
-            continue
+            label = "baseline"
 
-        for i in range(n_win):
-            seg_start = start + i * win
-            seg_end = seg_start + win
+            for _, ev in evts.iterrows():
+                core0, core1 = ev["t0"], ev["t1"]
 
-            # overlapper segmentet et anfald?
-            if not ev_rec.empty:
-                overlap_mask = (
-                    (ev_rec["absolute_start"] < seg_end) &
-                    (ev_rec["absolute_end"] > seg_start)
-                )
-                is_seizure = overlap_mask.any()
-            else:
-                is_seizure = False
+                # core overlap
+                if (w0 < core1) and (w1 > core0):
+                    label = "seizure_core"
+                    break
 
-            label = "seizure" if is_seizure else "baseline"
+                # extended overlap
+                if label_extended and seizure_buffer_s > 0:
+                    ext0 = core0 - seizure_buffer_s
+                    ext1 = core1 + seizure_buffer_s
+                    if (w0 < ext1) and (w1 > ext0):
+                        label = "seizure_extended"
 
             rows.append({
-                "segment_id": seg_id,
-                "patient_id": pid,
-                "enrollment_id": enr,
-                "recording_uid": rid,
-                "segment_start": seg_start,
-                "segment_end": seg_end,
-                "label": label,
+                "recording_uid": uid,
+                "patient_id": rec["patient_id"],
+                "recording_id": rec["recording_id"],
+                "win_start_s": w0,
+                "win_end_s": w1,
+                "context": label,
             })
-            seg_id += 1
 
     return pd.DataFrame(rows)
+

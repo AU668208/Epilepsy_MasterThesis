@@ -3,6 +3,7 @@ import pandas as pd
 from pathlib import Path
 import matplotlib.pyplot as plt
 from scipy.signal import butter, filtfilt, iirnotch, welch
+from tqdm import tqdm
 
 from src.hrv_epatch.io.tdms import load_tdms_from_path
 

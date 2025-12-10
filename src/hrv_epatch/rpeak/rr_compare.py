@@ -347,27 +347,33 @@ def detect_rpeaks_python(
 # ---------------------------------------------------------
 
 
+from typing import Optional, Tuple, Dict
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
 def process_recording(
     cfg: RecordingConfig,
     save_aligned_path: Optional[Path] = None,
     delta_range_s: Tuple[float, float] = (-2.0, 2.0),
     delta_step_s: float = 0.05,
     tol_s: float = 0.15,
-    max_duration_s: float | None = None,
+    max_duration_s: float | None = None,  # NEW: begræns længden
 ) -> Dict[str, float]:
     """
     Kører hele RR-sammenligningen for én optagelse.
 
     Trin:
     1) Load u-trimmet TDMS og hent EKG + starttid.
-    2) Kør Python-R-peak detektion på hele signalet.
+    2) Kør Python-R-peak detektion på hele signalet (eller første max_duration_s).
     3) Læs LabVIEW-RR + første R-peak timestamp fra LVM.
     4) Konvertér begge til absolut tid + RR.
     5) Find bedste tids-offset (delta) via simpel grid search.
     6) Beregn metrics (MAE, RMSE, korrelation, HR-diff).
     7) Gem evt. aligned RR-serier til CSV.
 
-    Returnerer en dict med metrics + metadata.
+    Hvis max_duration_s er sat (fx 3*3600), bruges kun de første
+    max_duration_s af TDMS-signalet til Python-R-peaks.
     """
     # ---------------------------------------------
     # 1) TDMS: load signal + metadata
@@ -379,9 +385,11 @@ def process_recording(
     )
 
     fs = float(cfg.fs)
-    # antag EKG i første kolonne
-    ecg = np.asarray(sig)[:]
 
+    # antag EKG i første kolonne
+    ecg_full = np.asarray(sig)[:]
+
+    # NEW: begræns længde hvis ønsket
     if max_duration_s is not None:
         n_max = int(max_duration_s * fs)
         ecg = ecg_full[:n_max]
@@ -398,7 +406,6 @@ def process_recording(
     # ---------------------------------------------
     r_idx_py = detect_rpeaks_python(ecg, fs=fs, method=cfg.algo_id)
     t_R_py, RR_py = rpeaks_to_times_and_rr(r_idx_py, fs=fs, t0_tdms_dt=t0_tdms_dt)
-
 
     # ---------------------------------------------
     # 3) LabVIEW: RR + første R-peak timestamp
@@ -424,11 +431,11 @@ def process_recording(
     )
 
     # ---------------------------------------------
-    # 5) Beregn metrics
+    # 5) Beregn RR-metrics
     # ---------------------------------------------
     metrics = compute_rr_metrics(rr_ref=rr_lv_m, rr_test=rr_py_m)
 
-        # ---------------------------------------------
+    # ---------------------------------------------
     # 5b) Peak-level matching og metrics (TP/FP/FN)
     # ---------------------------------------------
     # 1) LabVIEW peak-tider (sekunder siden epoch)
@@ -441,11 +448,10 @@ def process_recording(
         t_peaks_ref=t_peaks_lv,
         t_peaks_test=t_peaks_py,
         delta_s=best_delta,
-        tol_s=0.04,  # eller evt. 0.03 / 0.04 hvis du vil være strengere
+        tol_s=0.04,
     )
 
-
-        # ---------------------------------------------
+    # ---------------------------------------------
     # 5c) Relative tider for første R-peak (til TDMS-start)
     # ---------------------------------------------
     tdms_start_epoch = float(t0_tdms_dt.timestamp())
@@ -458,7 +464,6 @@ def process_recording(
         np.isfinite(py_first_r_rel_s) and np.isfinite(lv_first_r_rel_s)
     ) else np.nan
 
-
     peak_metrics = compute_peak_metrics(
         tp=len(tp_lv_idx),
         fp=len(fp_py_idx),
@@ -466,33 +471,26 @@ def process_recording(
     )
 
     # ---------------------------------------------
-    # 6) Beregn RR-metrics (som før) og opdatér dict
+    # 6) Saml alle metrics + metadata
     # ---------------------------------------------
-    metrics = compute_rr_metrics(rr_ref=rr_lv_m, rr_test=rr_py_m)
-
     metrics.update(
         {
             "patient_id": cfg.patient_id,
             "recording_id": cfg.recording_id,
-
             "algo_id": cfg.algo_id,
             "trim_label": cfg.trim_label,
-
             "n_rr_labview_total": int(RR_lv.size),
             "n_rr_python_total": int(RR_py.size),
             "n_rr_matched": int(metrics["n_common"]),
             "best_delta_s": float(best_delta),
-
             "tdms_start_epoch": tdms_start_epoch,
             "labview_first_r_epoch": lv_first_r_epoch,
             "python_first_r_epoch": py_first_r_epoch,
             "labview_first_r_rel_s": lv_first_r_rel_s,
             "python_first_r_rel_s": py_first_r_rel_s,
             "first_r_rel_diff_s": first_r_rel_diff_s,
-
             "raw_tdms_path": str(cfg.tdms_path),
             "raw_lvm_path": str(cfg.lvm_path),
-
             "n_peaks_labview_total": int(t_peaks_lv.size),
             "n_peaks_python_total": int(t_peaks_py.size),
             "n_peaks_tp": int(peak_metrics["tp"]),
@@ -504,9 +502,8 @@ def process_recording(
         }
     )
 
-
     # ---------------------------------------------
-    # 6) Gem aligned RR-serier (valgfrit)
+    # 7) Gem aligned RR-serier (valgfrit)
     # ---------------------------------------------
     if save_aligned_path is not None:
         save_aligned_path.parent.mkdir(parents=True, exist_ok=True)
@@ -519,6 +516,7 @@ def process_recording(
         df_aligned.to_csv(save_aligned_path, index=False)
 
     return metrics
+
 
 def plot_rr_alignment(t_R_lv, RR_lv, t_R_py, RR_py, delta_s, tol_s=0.15):
     """
@@ -850,6 +848,7 @@ def run_rr_comparison_from_df(
     delta_range_s: tuple[float, float] = (-2.0, 2.0),
     delta_step_s: float = 0.05,
     tol_s: float = 0.15,
+    max_duration_s: float | None = None,  # NEW
 ) -> pd.DataFrame:
     """
     df_index forventes at have mindst:
@@ -876,7 +875,6 @@ def run_rr_comparison_from_df(
 
     rows = []
 
-    # total iterations = antal recordings * antal metoder
     total_iters = len(df) * len(methods)
 
     with tqdm(total=total_iters, desc="RR/peak comparison") as pbar:
@@ -900,7 +898,6 @@ def run_rr_comparison_from_df(
                         base = f"{row['recording_uid']}"
                     else:
                         base = f"p{cfg.patient_id:02d}_r{cfg.recording_id:02d}"
-                    # inkluder metode og trim i filnavn
                     suffix_trim = f"_{trim_label}" if trim_label is not None else ""
                     fname = f"{base}_{method}{suffix_trim}_rr_aligned.csv"
                     save_path = aligned_dir / fname
@@ -911,12 +908,14 @@ def run_rr_comparison_from_df(
                     delta_range_s=delta_range_s,
                     delta_step_s=delta_step_s,
                     tol_s=tol_s,
+                    max_duration_s=max_duration_s,  # NEW: send videre
                 )
                 rows.append(metrics)
                 pbar.update(1)
 
     df_metrics = pd.DataFrame(rows)
     return df_metrics
+
 
 def load_labview_peaks(lvm_path: str | Path):
     """

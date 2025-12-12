@@ -340,6 +340,62 @@ def detect_rpeaks_python(
 
 #     return np.asarray(rpeaks_idx, dtype=np.int64)
 
+from pathlib import Path
+import numpy as np
+
+def _rpeak_cache_path(
+    cache_dir: Path,
+    patient_id: int,
+    recording_id: int,
+    algo_id: str,
+    fs: float,
+    max_duration_s: float | None,
+    recording_uid: str | None = None,
+) -> Path:
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    fs_tag = int(round(fs))
+    dur_tag = "full" if max_duration_s is None else f"{int(round(max_duration_s))}s"
+    base = recording_uid if recording_uid is not None else f"p{patient_id:02d}_r{recording_id:02d}"
+    fname = f"{base}__{algo_id}__fs{fs_tag}__{dur_tag}__rpeaks_idx.npz"
+    return cache_dir / fname
+
+
+def get_or_compute_rpeaks_idx(
+    ecg: np.ndarray,
+    fs: float,
+    cfg,
+    max_duration_s: float | None,
+    cache_dir: Path | None = None,
+    force_recompute: bool = False,
+    recording_uid: str | None = None,
+) -> np.ndarray:
+    """
+    Returnerer rpeaks sample-indeks (np.int64).
+    Hvis cache_dir er angivet, forsøger den at loade/gemme.
+    """
+    if cache_dir is not None:
+        p = _rpeak_cache_path(
+            cache_dir=cache_dir,
+            patient_id=cfg.patient_id,
+            recording_id=cfg.recording_id,
+            algo_id=cfg.algo_id,
+            fs=fs,
+            max_duration_s=max_duration_s,
+            recording_uid=recording_uid,
+        )
+        if (not force_recompute) and p.exists():
+            data = np.load(p, allow_pickle=False)
+            return data["r_idx"].astype(np.int64)
+
+    # compute
+    r_idx = detect_rpeaks_python(ecg, fs=fs, method=cfg.algo_id)
+
+    if cache_dir is not None:
+        np.savez_compressed(p, r_idx=r_idx.astype(np.int32))  # int32 er rigeligt til sample-indeks
+
+    return r_idx
 
 
 # ---------------------------------------------------------
@@ -359,6 +415,8 @@ def process_recording(
     delta_step_s: float = 0.05,
     tol_s: float = 0.15,
     max_duration_s: float | None = None,  # NEW: begræns længden
+    rpeak_cache_dir: Path | None = None,
+    force_recompute: bool = False,
 ) -> Dict[str, float]:
     """
     Kører hele RR-sammenligningen for én optagelse.
@@ -402,10 +460,17 @@ def process_recording(
         raise ValueError("TDMS metadata indeholder ikke 'start_time'.")
 
     # ---------------------------------------------
-    # 2) Python R-peak detektion
-    # ---------------------------------------------
-    r_idx_py = detect_rpeaks_python(ecg, fs=fs, method=cfg.algo_id)
+    # 2) Python R-peak detektion (med cache)
+    r_idx_py = get_or_compute_rpeaks_idx(
+        ecg=ecg,
+        fs=fs,
+        cfg=cfg,
+        max_duration_s=max_duration_s,
+        cache_dir=rpeak_cache_dir,      # ny parameter til process_recording
+        force_recompute=force_recompute # ny parameter til process_recording
+    )
     t_R_py, RR_py = rpeaks_to_times_and_rr(r_idx_py, fs=fs, t0_tdms_dt=t0_tdms_dt)
+
 
     # ---------------------------------------------
     # 3) LabVIEW: RR + første R-peak timestamp
@@ -849,6 +914,8 @@ def run_rr_comparison_from_df(
     delta_step_s: float = 0.05,
     tol_s: float = 0.15,
     max_duration_s: float | None = None,  # NEW
+    rpeak_cache_dir: Path | None = None,
+    force_recompute: bool = False,
 ) -> pd.DataFrame:
     """
     df_index forventes at have mindst:
@@ -908,8 +975,11 @@ def run_rr_comparison_from_df(
                     delta_range_s=delta_range_s,
                     delta_step_s=delta_step_s,
                     tol_s=tol_s,
-                    max_duration_s=max_duration_s,  # NEW: send videre
+                    max_duration_s=max_duration_s,
+                    rpeak_cache_dir=rpeak_cache_dir,
+                    force_recompute=force_recompute,
                 )
+
                 rows.append(metrics)
                 pbar.update(1)
 

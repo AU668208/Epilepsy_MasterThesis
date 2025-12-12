@@ -397,6 +397,13 @@ def get_or_compute_rpeaks_idx(
 
     return r_idx
 
+def sync_peak_trains(t_lv, t_py, max_search=10):
+        # find første fælles peak i starten
+        for i in range(max_search):
+            j = np.argmin(np.abs(t_py - t_lv[i]))
+            if abs(t_py[j] - t_lv[i]) < 0.2:  # 200 ms
+                return t_lv[i:], t_py[j:]
+        raise RuntimeError("No common peak found")
 
 # ---------------------------------------------------------
 # Samlet process_recording-funktion
@@ -509,12 +516,27 @@ def process_recording(
     # 2) Python peak-tider (t_R_py er allerede peaks) – brug samme best_delta
     t_peaks_py = t_R_py  # rename for klarhed
 
-    tp_lv_idx, tp_py_idx, fn_lv_idx, fp_py_idx = match_rpeaks_time_based_global(
-        t_peaks_ref=t_peaks_lv,
-        t_peaks_test=t_peaks_py,
-        delta_s=best_delta,
-        tol_s=0.04,
-    )
+    # t_peaks_py_aligned = t_peaks_py + best_delta
+
+    # t_peaks_lv, t_peaks_py_aligned = sync_peak_trains(t_peaks_lv, t_peaks_py_aligned)
+
+    tols = [0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20]
+    out = []
+
+    for tol in tols:
+        tp_lv_idx, tp_py_idx, fn_lv_idx, fp_py_idx = match_rpeaks_time_based_global(
+            t_peaks_ref=t_peaks_lv,
+            t_peaks_test=t_peaks_py,
+            delta_s=best_delta,
+            tol_s=tol,
+        )
+        pm = compute_peak_metrics(tp=len(tp_ref), fp=len(fp_test), fn=len(fn_ref))
+        out.append({"tol_s": tol, "tp": len(tp_ref), "fp": len(fp_test), "fn": len(fn_ref), "f1": pm["f1"]})
+
+        dt = t_peaks_py[tp_test] + best_delta - t_peaks_lv[tp_ref]   # sekunder
+        pd.Series(dt).describe(percentiles=[0.01,0.05,0.5,0.95,0.99])
+
+    pd.DataFrame(out)
 
     # ---------------------------------------------
     # 5c) Relative tider for første R-peak (til TDMS-start)

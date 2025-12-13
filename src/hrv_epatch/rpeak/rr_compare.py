@@ -744,6 +744,7 @@ def audit_peak_mismatches(
     t_peaks_lv_ov: np.ndarray,
     t_peaks_py_ov: np.ndarray,
     best_delta_s: float,
+    delta_lv: float,
     tp_lv_idx: np.ndarray,
     tp_py_idx: np.ndarray,
     fn_lv_idx: np.ndarray,
@@ -816,11 +817,13 @@ def audit_peak_mismatches(
 
         # vertikale markører (lokalt)
         # LV peak (ref) = ev.t_lv ; PY peak (test) = ev.t_py ; test-aligned = ev.t_py + best_delta_s
+        # LV (shifted to TDMS/Python axis)
         if ev.t_lv is not None:
-            ax.axvline((ev.t_lv - t0_tdms_epoch), linestyle="--", linewidth=1.0)
+            ax.axvline((ev.t_lv + delta_lv - t0_tdms_epoch), linestyle="--", linewidth=1.0)
+
+        # PY (fixed)
         if ev.t_py is not None:
             ax.axvline((ev.t_py - t0_tdms_epoch), linestyle=":", linewidth=1.0)
-            ax.axvline((ev.t_py + best_delta_s - t0_tdms_epoch), linestyle="-.", linewidth=1.0)
 
         title = f"{uid} | {algo_id} | {ev.kind} | t={ev.t_event:.3f}"
         if ev.window_idx is not None:
@@ -1059,23 +1062,106 @@ def process_recording(
     lv_ov = t_peaks_lv[(t_peaks_lv >= overlap_start) & (t_peaks_lv <= overlap_end)]
     py_ov = t_peaks_py[(t_peaks_py >= overlap_start) & (t_peaks_py <= overlap_end)]
 
+    ## Extra check - Sanity check
+    def _refine_delta_lv_by_matched_median(
+        t_lv: np.ndarray,
+        t_py: np.ndarray,
+        delta_lv: float,
+        tol_s: float = 0.04,
+        min_tp: int = 200,
+        max_adjust_s: float = 0.2,
+    ) -> tuple[float, dict]:
+        """
+        Forfin delta_lv ved at bruge median signed dt på de matchede peaks.
+        Flytter KUN LabVIEW (delta_lv), aldrig Python.
+
+        Returnerer (delta_lv_refined, debug_info)
+        """
+        tp_lv_idx, tp_py_idx, fn_lv_idx, fp_py_idx = match_rpeaks_time_based_global(
+            t_peaks_ref=t_lv,
+            t_peaks_test=t_py,
+            delta_s=delta_lv,
+            tol_s=tol_s,
+            shift_ref=True,
+        )
+
+        info = {
+            "tp": int(len(tp_lv_idx)),
+            "fp": int(len(fp_py_idx)),
+            "fn": int(len(fn_lv_idx)),
+            "median_dt_ms": np.nan,
+            "p95_abs_dt_ms": np.nan,
+            "delta_lv_before": float(delta_lv),
+            "delta_lv_after": float(delta_lv),
+        }
+
+        if len(tp_lv_idx) < min_tp:
+            return delta_lv, info
+
+        dt = t_py[tp_py_idx] - (t_lv[tp_lv_idx] + delta_lv)  # signed seconds
+        med = float(np.median(dt))
+        info["median_dt_ms"] = med * 1e3
+        info["p95_abs_dt_ms"] = float(np.percentile(np.abs(dt), 95)) * 1e3
+
+        # undgå voldsomme “justeringer” pga. et skævt match
+        med = float(np.clip(med, -max_adjust_s, max_adjust_s))
+
+        delta_lv_ref = delta_lv + med
+        info["delta_lv_after"] = float(delta_lv_ref)
+
+        return delta_lv_ref, info
+
+
+
     # -------- 6) estimer lille delta fra peaks --------
     best_delta = _estimate_delta_from_peaks(lv_ov, py_ov, max_abs_dt_s=1.0)
 
-    # match peaks (KUN overlap-området, internt i match-funktionen)
+    # ... du har allerede estimeret best_delta og sat delta_lv ...
+    delta_lv = -best_delta
+
+    # 2C: ultrahurtig “lag check” / refinement (kun for Hamilton hvis du vil)
+    if str(cfg.algo_id) == "hamilton2002":
+        delta_lv_ref, info = _refine_delta_lv_by_matched_median(
+            t_lv=lv_ov,
+            t_py=py_ov,
+            delta_lv=delta_lv,
+            tol_s=0.04,
+            min_tp=500,  # justér evt
+        )
+        if debug:
+            print(f"[DEBUG] Hamilton refine: median_dt={info['median_dt_ms']:.3f} ms "
+                f"(p95|dt|={info['p95_abs_dt_ms']:.3f} ms) "
+                f"delta_lv {info['delta_lv_before']:.6f} -> {info['delta_lv_after']:.6f}")
+
+        delta_lv = delta_lv_ref  # <-- brug den refined fremover
+
+    # match igen (nu med refined delta_lv)
     tp_lv_idx, tp_py_idx, fn_lv_idx, fp_py_idx = match_rpeaks_time_based_global(
         t_peaks_ref=lv_ov,
         t_peaks_test=py_ov,
-        delta_s=best_delta,
-        tol_s=0.04,  # 40 ms
+        delta_s=delta_lv,
+        tol_s=0.04,
+        shift_ref=True,
     )
 
+
+    tp_lv_idx, tp_py_idx, fn_lv_idx, fp_py_idx = match_rpeaks_time_based_global(
+        t_peaks_ref=lv_ov,           # <-- MATCH PÅ OVERLAP
+        t_peaks_test=py_ov,
+        delta_s=delta_lv,            # flyt LabVIEW til Python-aksen
+        tol_s=0.04,
+        shift_ref=True,
+    )
+
+
+
     if debug:
-        print(f"[DEBUG] best_delta_s: {best_delta:.6f}")
+        print(f"[DEBUG] best_delta_s (py->lv): {best_delta:.6f}")
+        print(f"[DEBUG] delta_lv_s  (lv->py): {delta_lv:.6f}")
         print(f"[DEBUG] overlap_start/end epoch: {overlap_start:.3f} -> {overlap_end:.3f}")
         print(f"[DEBUG] matched peaks: {len(tp_lv_idx)}")
         if len(tp_lv_idx) > 0:
-            dt_ms = (py_ov[tp_py_idx] + best_delta - lv_ov[tp_lv_idx]) * 1e3
+            dt_ms = (py_ov[tp_py_idx] - (lv_ov[tp_lv_idx] + delta_lv)) * 1e3
             print(f"[DEBUG] median |dt| (ms): {np.median(np.abs(dt_ms)):.3f}")
             print(f"[DEBUG] p95 |dt| (ms): {np.percentile(np.abs(dt_ms), 95):.3f}")
 
@@ -1092,6 +1178,7 @@ def process_recording(
             t_peaks_lv_ov=lv_ov,
             t_peaks_py_ov=py_ov,
             best_delta_s=best_delta,
+            delta_lv=delta_lv,
             tp_lv_idx=tp_lv_idx,
             tp_py_idx=tp_py_idx,
             fn_lv_idx=fn_lv_idx,
@@ -1104,22 +1191,41 @@ def process_recording(
             df_win=None,  # <-- kan du koble på senere
         )
 
+    # -------- 6b) first-R diagnostics (Python stays fixed, LabVIEW shifts) --------
+    tdms_start_epoch = float(t0_tdms_epoch)
+
+    lv_first_r_epoch_raw = float(t_peaks_lv[0]) if t_peaks_lv.size else np.nan
+    lv_first_r_epoch = float(t_peaks_lv[0] + delta_lv) if t_peaks_lv.size else np.nan  # <-- shifted LV
+
+    py_first_r_epoch = float(t_peaks_py[0]) if t_peaks_py.size else np.nan             # <-- NOT shifted
+
+    lv_first_r_rel_s = lv_first_r_epoch - tdms_start_epoch if np.isfinite(lv_first_r_epoch) else np.nan
+    py_first_r_rel_s = py_first_r_epoch - tdms_start_epoch if np.isfinite(py_first_r_epoch) else np.nan
+    first_r_rel_diff_s = py_first_r_rel_s - lv_first_r_rel_s if (
+        np.isfinite(py_first_r_rel_s) and np.isfinite(lv_first_r_rel_s)
+    ) else np.nan
+
+
 
     peak_metrics = compute_peak_metrics(tp=len(tp_lv_idx), fp=len(fp_py_idx), fn=len(fn_lv_idx))
 
     # -------- 7) RR metrics --------
-    rr_lv_ov = np.diff(lv_ov)                 # LV RR i overlap
-    rr_py_ov = np.diff(py_ov + best_delta)    # PY RR i overlap (aligned)
+    lv_ov_shift = lv_ov + delta_lv
+    py_ov_fix = py_ov
+
+    rr_lv_ov = np.diff(lv_ov_shift)     # samme som diff(lv_ov)
+    rr_py_ov = np.diff(py_ov_fix)
 
     best_delta_rr, rr_lv_m, rr_py_m = find_best_delta(
-        t_R_lv=lv_ov[:-1],
+        t_R_lv=lv_ov_shift[:-1],
         RR_lv=rr_lv_ov,
-        t_R_py=(py_ov[:-1] + best_delta),
+        t_R_py=py_ov_fix[:-1],
         RR_py=rr_py_ov,
         delta_range_s=delta_range_s,
         delta_step_s=delta_step_s,
         tol_s=tol_s,
     )
+
     rr_metrics = compute_rr_metrics(rr_ref=rr_lv_m, rr_test=rr_py_m)
 
     # -------- 8) output --------
@@ -1151,6 +1257,17 @@ def process_recording(
 
             "raw_tdms_path": str(cfg.tdms_path),
             "raw_lvm_path": str(cfg.lvm_path),
+
+            "tdms_start_epoch": tdms_start_epoch,
+
+            "labview_first_r_epoch_raw": lv_first_r_epoch_raw,
+            "labview_first_r_epoch": lv_first_r_epoch,     # shifted
+            "python_first_r_epoch": py_first_r_epoch,       # unshifted
+
+            "labview_first_r_rel_s": lv_first_r_rel_s,
+            "python_first_r_rel_s": py_first_r_rel_s,
+            "first_r_rel_diff_s": first_r_rel_diff_s,
+
         }
     )
 
@@ -1209,19 +1326,36 @@ import numpy as np
 def match_rpeaks_time_based_global(
     t_peaks_ref: np.ndarray,
     t_peaks_test: np.ndarray,
-    delta_s: float = 0.0,
-    tol_s: float = 0.04,
+    delta_s: float,
+    tol_s: float = 0.05,
+    shift_ref: bool = False,
 ):
     """
-    Match peaks ved at time-shifte test med delta_s og greedy matche indenfor tol_s,
-    men KUN i overlappende tidsvindue (beregnet på SHIFTED test).
-    Returnerer indeks i original ref/test arrays.
-    """
-    t_peaks_ref = np.asarray(t_peaks_ref, float).ravel()
-    t_peaks_test = np.asarray(t_peaks_test, float).ravel()
+    Global peak alignment.
 
-    n_ref = t_peaks_ref.size
-    n_test = t_peaks_test.size
+    - t_peaks_ref  : reference peak times (seconds since epoch)
+    - t_peaks_test : test peak times (seconds since epoch)
+    - delta_s      : time shift applied to either test (default) or ref (if shift_ref=True)
+    - tol_s        : max difference for peaks to be considered a match
+
+    Returns:
+      tp_idx_ref, tp_idx_test, fn_idx_ref, fp_idx_test
+      (indices refer to ORIGINAL input arrays)
+    """
+    t_peaks_ref = np.asarray(t_peaks_ref, dtype=float)
+    t_peaks_test = np.asarray(t_peaks_test, dtype=float)
+
+    # Apply delta to the chosen series
+    if shift_ref:
+        t_ref = t_peaks_ref + float(delta_s)
+        t_test = t_peaks_test
+    else:
+        t_ref = t_peaks_ref
+        t_test = t_peaks_test + float(delta_s)
+
+    n_ref = t_ref.size
+    n_test = t_test.size
+
     if n_ref == 0 or n_test == 0:
         return (
             np.array([], dtype=int),
@@ -1230,59 +1364,40 @@ def match_rpeaks_time_based_global(
             np.arange(n_test, dtype=int),
         )
 
-    # 1) Shift test først
-    t_test_shift = t_peaks_test + float(delta_s)
-
-    # 2) Overlap beregnes på REF og SHIFTED test
-    window_start = max(t_peaks_ref[0], t_test_shift[0])
-    window_end   = min(t_peaks_ref[-1], t_test_shift[-1])
-
-    if window_end <= window_start:
-        return (
-            np.array([], dtype=int),
-            np.array([], dtype=int),
-            np.arange(n_ref, dtype=int),
-            np.arange(n_test, dtype=int),
-        )
-
-    # 3) Mask peaks indenfor overlap (ref på ref-tider, test på SHIFTED tider)
-    ref_mask = (t_peaks_ref >= window_start) & (t_peaks_ref <= window_end)
-    test_mask = (t_test_shift >= window_start) & (t_test_shift <= window_end)
-
-    t_ref_win = t_peaks_ref[ref_mask]
-    t_test_win = t_test_shift[test_mask]
-
-    ref_idx_win = np.where(ref_mask)[0]
-    test_idx_win = np.where(test_mask)[0]
-
-    # 4) Greedy matching
+    # Two-pointer matching on sorted times
     i = j = 0
     tp_ref = []
     tp_test = []
-    while i < t_ref_win.size and j < t_test_win.size:
-        dt = t_test_win[j] - t_ref_win[i]
+    fn_ref = []
+    fp_test = []
+
+    while i < n_ref and j < n_test:
+        dt = t_test[j] - t_ref[i]
         if abs(dt) <= tol_s:
-            tp_ref.append(ref_idx_win[i])
-            tp_test.append(test_idx_win[j])
+            tp_ref.append(i)
+            tp_test.append(j)
             i += 1
             j += 1
         elif dt < -tol_s:
+            fp_test.append(j)
             j += 1
         else:
+            fn_ref.append(i)
             i += 1
 
-    tp_ref = np.asarray(tp_ref, dtype=int)
-    tp_test = np.asarray(tp_test, dtype=int)
+    # leftovers
+    if i < n_ref:
+        fn_ref.extend(range(i, n_ref))
+    if j < n_test:
+        fp_test.extend(range(j, n_test))
 
-    # FN: ref peaks i overlap der ikke blev matchet
-    matched_ref_set = set(tp_ref.tolist())
-    fn_ref = np.asarray([idx for idx in ref_idx_win if idx not in matched_ref_set], dtype=int)
+    return (
+        np.asarray(tp_ref, dtype=int),
+        np.asarray(tp_test, dtype=int),
+        np.asarray(fn_ref, dtype=int),
+        np.asarray(fp_test, dtype=int),
+    )
 
-    # FP: test peaks i overlap der ikke blev matchet
-    matched_test_set = set(tp_test.tolist())
-    fp_test = np.asarray([idx for idx in test_idx_win if idx not in matched_test_set], dtype=int)
-
-    return tp_ref, tp_test, fn_ref, fp_test
 
 
 

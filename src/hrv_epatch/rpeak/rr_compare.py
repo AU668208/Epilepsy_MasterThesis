@@ -81,7 +81,7 @@ def match_rr_series_time_based(
     t_R_py: np.ndarray,
     RR_py: np.ndarray,
     delta_s: float = 0.0,
-    tol_s: float = 0.15,
+    tol_s: float = 0.04,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Matcher RR-intervaller ved at align'e tidspunkter.
@@ -132,7 +132,7 @@ def find_best_delta(
     RR_py: np.ndarray,
     delta_range_s: Tuple[float, float] = (-2.0, 2.0),
     delta_step_s: float = 0.05,
-    tol_s: float = 0.15,
+    tol_s: float = 0.04,
 ) -> Tuple[float, np.ndarray, np.ndarray]:
     """
     Finder det delta_s der giver lavest MAE mellem matchende RR-intervaller
@@ -953,7 +953,7 @@ def process_recording(
     save_aligned_path: Optional[Path] = None,
     delta_range_s: Tuple[float, float] = (-2.0, 2.0),
     delta_step_s: float = 0.05,
-    tol_s: float = 0.15,
+    tol_s: float = 0.04,
     max_duration_s: Optional[float] = None,
     rpeak_cache_dir: Optional[Path] = None,
     force_recompute: bool = False,
@@ -1144,15 +1144,14 @@ def process_recording(
         shift_ref=True,
     )
 
-
-    tp_lv_idx, tp_py_idx, fn_lv_idx, fp_py_idx = match_rpeaks_time_based_global(
-        t_peaks_ref=lv_ov,           # <-- MATCH PÅ OVERLAP
-        t_peaks_test=py_ov,
-        delta_s=delta_lv,            # flyt LabVIEW til Python-aksen
-        tol_s=0.04,
-        shift_ref=True,
-    )
-
+    # dt for matched peaks (PY fixed, LV shifted by delta_lv)
+    if len(tp_lv_idx) > 0:
+        dt_ms = (py_ov[tp_py_idx] - (lv_ov[tp_lv_idx] + delta_lv)) * 1e3
+        median_dt_ms = float(np.median(dt_ms))
+        p95_abs_dt_ms = float(np.percentile(np.abs(dt_ms), 95))
+    else:
+        median_dt_ms = np.nan
+        p95_abs_dt_ms = np.nan
 
 
     if debug:
@@ -1268,6 +1267,8 @@ def process_recording(
             "python_first_r_rel_s": py_first_r_rel_s,
             "first_r_rel_diff_s": first_r_rel_diff_s,
 
+            "median_dt_ms": median_dt_ms,
+            "p95_abs_dt_ms": p95_abs_dt_ms,
         }
     )
 
@@ -1281,7 +1282,7 @@ def process_recording(
 
 
 
-def plot_rr_alignment(t_R_lv, RR_lv, t_R_py, RR_py, delta_s, tol_s=0.15):
+def plot_rr_alignment(t_R_lv, RR_lv, t_R_py, RR_py, delta_s, tol_s=0.04):
     """
     Visualiserer forskellen mellem LabVIEW og Python RR over tid.
 
@@ -1327,7 +1328,7 @@ def match_rpeaks_time_based_global(
     t_peaks_ref: np.ndarray,
     t_peaks_test: np.ndarray,
     delta_s: float,
-    tol_s: float = 0.05,
+    tol_s: float = 0.04,
     shift_ref: bool = False,
 ):
     """
@@ -1430,7 +1431,7 @@ def plot_alignment_summary(
     t_R_py: np.ndarray,
     RR_py: np.ndarray,
     best_delta_s: float,
-    tol_s: float = 0.15,
+    tol_s: float = 0.04,
     big_thresh_ms: float = 50.0,
     title_suffix: str = "",
 ):
@@ -1531,7 +1532,7 @@ def run_rr_comparison(
     patient_filter: Optional[List[int]] = None,
     delta_range_s: tuple[float, float] = (-2.0, 2.0),
     delta_step_s: float = 0.05,
-    tol_s: float = 0.15,
+    tol_s: float = 0.04,
 ) -> pd.DataFrame:
     """
     Kører RR- og peak-sammenligning for alle optagelser i index_csv.
@@ -1581,7 +1582,7 @@ def run_rr_comparison_from_df(
     patient_filter: list[int] | None = None,
     delta_range_s: tuple[float, float] = (-2.0, 2.0),
     delta_step_s: float = 0.05,
-    tol_s: float = 0.15,
+    tol_s: float = 0.04,
     max_duration_s: float | None = None,  # NEW
     rpeak_cache_dir: Path | None = None,
     force_recompute: bool = False,
@@ -1614,7 +1615,7 @@ def run_rr_comparison_from_df(
 
     total_iters = len(df) * len(methods)
 
-    with tqdm(total=total_iters, desc="RR/peak comparison") as pbar:
+    with tqdm(total=total_iters, desc=f"RR/peak comparison for:") as pbar:
         for _, row in df.iterrows():
             trim_label = row["trim_label"] if "trim_label" in row else None
 

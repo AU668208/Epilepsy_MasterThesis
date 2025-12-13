@@ -450,23 +450,23 @@ def _reconstruct_lv_peak_times_epoch(rr_lv_s: np.ndarray, lv_header_dt) -> np.nd
     t_rel = np.cumsum(np.insert(rr_lv_s, 0, 0.0))  # første peak ved t0
     return t0_epoch + t_rel
 
-def _cache_path_for_rpeaks(
-    cache_dir: Path,
-    tdms_path: Path,
-    algo_id: str,
-    max_duration_s: Optional[float],
-) -> Path:
-    """
-    Cache filnavn: baseret på TDMS filnavn + algo + evt max_duration.
-    (Du kan gøre det endnu mere robust med recording_uid hvis du vil.)
-    """
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+# def _cache_path_for_rpeaks(
+#     cache_dir: Path,
+#     tdms_path: Path,
+#     algo_id: str,
+#     max_duration_s: Optional[float],
+# ) -> Path:
+#     """
+#     Cache filnavn: baseret på TDMS filnavn + algo + evt max_duration.
+#     (Du kan gøre det endnu mere robust med recording_uid hvis du vil.)
+#     """
+#     cache_dir = Path(cache_dir)
+#     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    stem = tdms_path.stem
-    dur_tag = "full" if max_duration_s is None else f"dur{int(max_duration_s)}s"
-    fname = f"{stem}__{algo_id}__{dur_tag}__rpeaks.npy"
-    return cache_dir / fname
+#     stem = tdms_path.stem
+#     dur_tag = "full" if max_duration_s is None else f"dur{int(max_duration_s)}s"
+#     fname = f"{stem}__{algo_id}__{dur_tag}__rpeaks.npy"
+#     return cache_dir / fname
 
 def _crop_python_peaks_to_lv_window(
     r_idx_py: np.ndarray,
@@ -711,6 +711,170 @@ def plot_peak_audit_examples(
     fig.tight_layout()
     plt.show()
 
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Sequence
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+@dataclass
+class AuditEvent:
+    kind: str          # "FN" eller "FP"
+    t_event: float     # epoch-sekunder (reference for FN, test for FP)
+    t_lv: Optional[float] = None
+    t_py: Optional[float] = None
+    dt_s: Optional[float] = None
+    window_idx: Optional[int] = None
+    ours_bad: Optional[bool] = None
+    nk_bad: Optional[bool] = None
+
+
+def _epoch_to_tdms_sample(t_epoch: float, t0_tdms_epoch: float, fs: float) -> int:
+    return int(np.round((t_epoch - t0_tdms_epoch) * fs))
+
+
+def audit_peak_mismatches(
+    *,
+    ecg_full: np.ndarray,
+    fs: float,
+    t0_tdms_epoch: float,
+    t_peaks_lv_ov: np.ndarray,
+    t_peaks_py_ov: np.ndarray,
+    best_delta_s: float,
+    tp_lv_idx: np.ndarray,
+    tp_py_idx: np.ndarray,
+    fn_lv_idx: np.ndarray,
+    fp_py_idx: np.ndarray,
+    out_dir: Path,
+    uid: str,
+    algo_id: str,
+    n_events_each: int = 20,
+    pad_s: float = 2.0,
+    df_win: Optional[pd.DataFrame] = None,  # skal have win_abs_start/win_abs_end/ours_bad/nk_bad
+    rng_seed: int = 123,
+) -> pd.DataFrame:
+    """
+    Gemmer PNG-plots omkring FP/FN mismatch-events og returnerer tabel med events.
+
+    Bemærk:
+      - t_peaks_py_ov er i epoch, men matcher med best_delta_s (dvs. test+delta vs ref).
+      - For FP bruger vi test-peak epoch (uden delta) som event-tidspunkt, men plot markerer delta-korrigeret position.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ecg_full = np.asarray(ecg_full, float).ravel()
+    rng = np.random.default_rng(rng_seed)
+
+    events: list[AuditEvent] = []
+
+    # samle FN (ref peaks uden match)
+    fn_times = t_peaks_lv_ov[fn_lv_idx] if fn_lv_idx.size else np.array([])
+    fp_times = t_peaks_py_ov[fp_py_idx] if fp_py_idx.size else np.array([])
+
+    fn_pick = fn_times if fn_times.size <= n_events_each else rng.choice(fn_times, n_events_each, replace=False)
+    fp_pick = fp_times if fp_times.size <= n_events_each else rng.choice(fp_times, n_events_each, replace=False)
+
+    # helper: find nærmeste match (til annotering)
+    def nearest(arr: np.ndarray, x: float) -> tuple[Optional[float], Optional[float]]:
+        if arr.size == 0:
+            return None, None
+        j = int(np.argmin(np.abs(arr - x)))
+        return float(arr[j]), float(arr[j] - x)
+
+    # optional window lookup
+    def attach_window_info(ev: AuditEvent):
+        if df_win is None or df_win.empty:
+            return
+        # forventer epoch timestamps i win_abs_start/end
+        m = (df_win["win_abs_start"].astype("int64")/1e9 <= ev.t_event) & (df_win["win_abs_end"].astype("int64")/1e9 >= ev.t_event)
+        if not m.any():
+            return
+        row = df_win.loc[m].iloc[0]
+        ev.window_idx = int(row.get("window_idx")) if "window_idx" in row else None
+        if "ours_bad" in row:
+            ev.ours_bad = bool(row["ours_bad"])
+        if "nk_bad" in row:
+            ev.nk_bad = bool(row["nk_bad"])
+
+    # plotting
+    pad_n = int(np.round(pad_s * fs))
+
+    def plot_event(ev: AuditEvent, k: int):
+        s_center = _epoch_to_tdms_sample(ev.t_event, t0_tdms_epoch, fs)
+        s0 = max(0, s_center - pad_n)
+        s1 = min(ecg_full.size, s_center + pad_n)
+
+        x = (np.arange(s0, s1) / fs)  # sekunder relativt til TDMS start
+        y = ecg_full[s0:s1]
+
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.plot(x, y, linewidth=0.8)
+
+        # vertikale markører (lokalt)
+        # LV peak (ref) = ev.t_lv ; PY peak (test) = ev.t_py ; test-aligned = ev.t_py + best_delta_s
+        if ev.t_lv is not None:
+            ax.axvline((ev.t_lv - t0_tdms_epoch), linestyle="--", linewidth=1.0)
+        if ev.t_py is not None:
+            ax.axvline((ev.t_py - t0_tdms_epoch), linestyle=":", linewidth=1.0)
+            ax.axvline((ev.t_py + best_delta_s - t0_tdms_epoch), linestyle="-.", linewidth=1.0)
+
+        title = f"{uid} | {algo_id} | {ev.kind} | t={ev.t_event:.3f}"
+        if ev.window_idx is not None:
+            title += f" | win={ev.window_idx}"
+        if ev.ours_bad is not None:
+            title += f" | ours_bad={ev.ours_bad}"
+        if ev.nk_bad is not None:
+            title += f" | nk_bad={ev.nk_bad}"
+        ax.set_title(title)
+        ax.set_xlabel("Seconds since TDMS start")
+        ax.set_ylabel("ECG")
+        ax.grid(True, alpha=0.2)
+
+        fname = f"{uid}__{algo_id}__{ev.kind}__{k:03d}.png"
+        fig.tight_layout()
+        fig.savefig(out_dir / fname, dpi=160)
+        plt.close(fig)
+
+    # --- FN events (manglende python-peak for LV peak)
+    for i, t_lv in enumerate(fn_pick):
+        # find nærmeste python (aligned) for reference
+        # vi sammenligner mod (py + best_delta)
+        t_py_near, dt = nearest(t_peaks_py_ov + best_delta_s, float(t_lv))
+        ev = AuditEvent(
+            kind="FN",
+            t_event=float(t_lv),
+            t_lv=float(t_lv),
+            t_py=(t_py_near - best_delta_s) if t_py_near is not None else None,
+            dt_s=dt,
+        )
+        attach_window_info(ev)
+        events.append(ev)
+        plot_event(ev, i)
+
+    # --- FP events (python-peak uden match i LV)
+    for i, t_py in enumerate(fp_pick):
+        # find nærmeste LV peak til aligned python peak
+        t_lv_near, dt = nearest(t_peaks_lv_ov, float(t_py + best_delta_s))
+        ev = AuditEvent(
+            kind="FP",
+            t_event=float(t_py),
+            t_lv=t_lv_near,
+            t_py=float(t_py),
+            dt_s=dt,
+        )
+        attach_window_info(ev)
+        events.append(ev)
+        plot_event(ev, i + 1000)
+
+    # return table + gem CSV
+    df = pd.DataFrame([e.__dict__ for e in events])
+    df.to_csv(out_dir / f"{uid}__{algo_id}__audit_events.csv", index=False)
+    return df
+
 
 
 # ---------------------------------------------------------
@@ -731,9 +895,9 @@ import json
 import numpy as np
 import pandas as pd
 
-def _to_epoch_seconds(dt) -> float:
-    """Robust: datetime -> epoch seconds (float)."""
-    return float(dt.timestamp())
+# def _to_epoch_seconds(dt) -> float:
+#     """Robust: datetime -> epoch seconds (float)."""
+#     return float(dt.timestamp())
 
 def _cache_path_for_rpeaks(
     cache_dir: Path,
@@ -749,32 +913,32 @@ def _cache_path_for_rpeaks(
     fname = f"{stem}__{method}__fs{int(round(fs))}__{tag}__rpeaks.npy"
     return cache_dir / fname
 
-def _load_or_compute_rpeaks(
-    ecg: np.ndarray,
-    fs: float,
-    tdms_path: Path,
-    method: str,
-    rpeak_cache_dir: Optional[Path],
-    max_duration_s: Optional[float],
-    force_recompute: bool,
-) -> np.ndarray:
-    """Returnerer rpeak-indices (samples) for Python-metoden, evt. fra cache."""
-    if rpeak_cache_dir is None:
-        return detect_rpeaks_python(ecg, fs=fs, method=method)
+# def _load_or_compute_rpeaks(
+#     ecg: np.ndarray,
+#     fs: float,
+#     tdms_path: Path,
+#     method: str,
+#     rpeak_cache_dir: Optional[Path],
+#     max_duration_s: Optional[float],
+#     force_recompute: bool,
+# ) -> np.ndarray:
+#     """Returnerer rpeak-indices (samples) for Python-metoden, evt. fra cache."""
+#     if rpeak_cache_dir is None:
+#         return detect_rpeaks_python(ecg, fs=fs, method=method)
 
-    cache_path = _cache_path_for_rpeaks(rpeak_cache_dir, tdms_path, method, fs, max_duration_s)
+#     cache_path = _cache_path_for_rpeaks(rpeak_cache_dir, tdms_path, method, fs, max_duration_s)
 
-    if (not force_recompute) and cache_path.exists():
-        try:
-            arr = np.load(cache_path)
-            return np.asarray(arr, dtype=np.int64)
-        except Exception:
-            # hvis cache er korrupt -> recompute
-            pass
+#     if (not force_recompute) and cache_path.exists():
+#         try:
+#             arr = np.load(cache_path)
+#             return np.asarray(arr, dtype=np.int64)
+#         except Exception:
+#             # hvis cache er korrupt -> recompute
+#             pass
 
-    r_idx = detect_rpeaks_python(ecg, fs=fs, method=method)
-    np.save(cache_path, np.asarray(r_idx, dtype=np.int64))
-    return np.asarray(r_idx, dtype=np.int64)
+#     r_idx = detect_rpeaks_python(ecg, fs=fs, method=method)
+#     np.save(cache_path, np.asarray(r_idx, dtype=np.int64))
+#     return np.asarray(r_idx, dtype=np.int64)
 
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -810,11 +974,11 @@ def process_recording(
     ecg_full = np.asarray(sig, dtype=float).ravel()
     fs = float(cfg.fs) if hasattr(cfg, "fs") and cfg.fs is not None else float(meta.fs)
 
-    t0_tdms_dt = meta.start_time
-    if t0_tdms_dt is None:
+    if meta.start_time is None:
         raise ValueError("TDMS metadata mangler start_time.")
-
-    t0_tdms_epoch = float(t0_tdms_dt.timestamp())
+    
+    t0_tdms_dt = meta.start_time
+    t0_tdms_epoch = _to_epoch_seconds(t0_tdms_dt, tz=getattr(cfg, "tz", "Europe/Copenhagen"))
 
     # evt. max_duration_s (hurtig testkørsel)
     if max_duration_s is not None:
@@ -824,30 +988,26 @@ def process_recording(
     # -------------------------
     # 2) Load LabVIEW RR + header tid
     # -------------------------
-    rr_lv = read_labview_rr(str(cfg.lvm_path))
-    t0_lv_dt = read_header_datetime_lvm(str(cfg.lvm_path))
-    if t0_lv_dt is None:
-        raise ValueError("Kunne ikke læse LabVIEW header datetime.")
-
-    t0_lv_epoch = float(t0_lv_dt.timestamp())
-
+    rr_lv = np.asarray(read_labview_rr(str(cfg.lvm_path)), float).ravel()
     if rr_lv.size == 0:
         raise ValueError("LabVIEW RR er tom.")
+    
+    t0_lv_dt = read_header_datetime_lvm(str(cfg.lvm_path))
+    if t0_lv_dt is None:
+        raise ValueError(f"Kunne ikke læse LabVIEW header datetime: {cfg.lvm_path}")
 
-    # Rekonstruér LabVIEW peak times (epoch)
-    # Antag: første peak ligger ved header-tidspunktet
-    t_peaks_lv = t0_lv_epoch + np.cumsum(np.insert(rr_lv.astype(float), 0, 0.0))
+    t0_lv_epoch = _to_epoch_seconds(t0_lv_dt, tz=getattr(cfg, "tz", "Europe/Copenhagen"))
 
-    # -------------------------
-    # 3) Definér LVM-vindue i TDMS-relative sekunder
-    # -------------------------
-    offset0_s = t0_lv_epoch - t0_tdms_epoch
-    lvm_start_rel_s = offset0_s
-    lvm_end_rel_s = offset0_s + float(np.sum(rr_lv))  # sidste peak ~ start + sum(rr)
+    # LabVIEW peak tider (epoch): første peak ved header-tid
+    t_peaks_lv = t0_lv_epoch + np.cumsum(np.insert(rr_lv, 0, 0.0))
 
-    # crop index i TDMS
-    crop_start = int(np.floor(lvm_start_rel_s * fs))
-    crop_end   = int(np.ceil(lvm_end_rel_s * fs))
+    # -------- 3) Definér LVM vindue relativt til TDMS og crop TDMS --------
+    offset0_s = t0_lv_epoch - t0_tdms_epoch  # typisk ~17.15s (warmup+filter)
+    lv_win_start_rel_s = offset0_s
+    lv_win_end_rel_s = offset0_s + float(np.sum(rr_lv))  # ca sidste peak-tid
+
+    crop_start = int(np.round(lv_win_start_rel_s * fs))
+    crop_end = int(np.round(lv_win_end_rel_s * fs))
 
     crop_start = max(0, crop_start)
     crop_end = min(len(ecg_full), crop_end)
@@ -855,93 +1015,102 @@ def process_recording(
     if crop_end - crop_start < int(5 * fs):
         raise ValueError("Efter crop er signalet for kort til meningsfuld sammenligning.")
 
-    ecg = ecg_full[crop_start:crop_end]
-    crop_start_rel_s = crop_start / fs
-    t0_crop_epoch = t0_tdms_epoch + crop_start_rel_s
+    # epoch tid for crop-start (TDMS)
+    t0_crop_epoch = t0_tdms_epoch + (crop_start / fs)
 
     if debug:
         print(f"[DEBUG] TDMS start dt   : {t0_tdms_dt} (epoch={t0_tdms_epoch:.6f})")
         print(f"[DEBUG] LVM  header dt : {t0_lv_dt} (epoch={t0_lv_epoch:.6f})")
         print(f"[DEBUG] offset0_s (LVM header - TDMS start): {offset0_s:.6f} s")
-        print(f"[DEBUG] LVM window start/end (rel. TDMS): {lvm_start_rel_s:.3f}s  -> {lvm_end_rel_s:.3f}s")
+        print(f"[DEBUG] LVM window start/end (rel. TDMS): {lv_win_start_rel_s:.3f}s  -> {lv_win_end_rel_s:.3f}s")
         print(f"[DEBUG] TDMS crop idx start/end: {crop_start} -> {crop_end}  (len(ecg_full)={len(ecg_full)})")
 
-    # -------------------------
-    # 4) Python R-peaks (cache)
-    # -------------------------
-    cache_path = None
-    if rpeak_cache_dir is not None:
-        cache_path = _cache_path_for_rpeaks(
-            cache_dir=Path(rpeak_cache_dir),
-            tdms_path=Path(cfg.tdms_path),
-            method=str(cfg.algo_id),
-            fs=float(fs),
-            max_duration_s=max_duration_s,
-        )
+    # -------- 4) Python peaks (cache på fuld TDMS) + crop til LVM vindue --------
+    recording_uid = getattr(cfg, "recording_uid", None)  # hvis du senere tilføjer den til cfg
+    r_idx_py_full = get_or_compute_rpeaks_idx(
+        ecg=ecg_full,
+        fs=fs,
+        cfg=cfg,
+        max_duration_s=max_duration_s,
+        cache_dir=rpeak_cache_dir,
+        force_recompute=force_recompute,
+        recording_uid=recording_uid,
+    )
 
-    if cache_path is not None and cache_path.exists() and not force_recompute:
-        r_idx_py_full = np.load(cache_path)
-    else:
-        r_idx_py_full = detect_rpeaks_python(ecg_full, fs=fs, method=str(cfg.algo_id))
-        if cache_path is not None:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.save(cache_path, r_idx_py_full)
-
-    # vælg peaks der ligger i crop-vinduet + lav dem til "lokale" indices
-    mask_crop = (r_idx_py_full >= crop_start) & (r_idx_py_full < crop_end)
-    r_idx_py = (r_idx_py_full[mask_crop] - crop_start).astype(np.int64)
-
-    # konvertér til epoch tider
+    # vælg de peaks der ligger indenfor crop-vinduet (ORIG tdms indices)
+    m = (r_idx_py_full >= crop_start) & (r_idx_py_full < crop_end)
+    r_idx_py = (r_idx_py_full[m] - crop_start).astype(np.int64)  # lokale indices i crop
     t_peaks_py = t0_crop_epoch + (r_idx_py.astype(float) / fs)
 
     if debug:
         print(f"[DEBUG] #py_peaks full={int(r_idx_py_full.size)}  cropped={int(r_idx_py.size)}  #lv_peaks={int(t_peaks_lv.size)}")
 
-    # -------------------------
-    # 5) Overlap i epoch (for fairness)
-    # -------------------------
-    overlap_start = max(t_peaks_lv[0], t_peaks_py[0])
-    overlap_end   = min(t_peaks_lv[-1], t_peaks_py[-1])
+    if t_peaks_py.size == 0:
+        raise ValueError("Ingen Python-peaks i LVM-vinduet efter crop.")
+
+
+    # -------- 5) overlap (fair sammenligning) --------
+    # NB: her er der endnu IKKE tilføjet best_delta
+    overlap_start = max(float(t_peaks_lv[0]), float(t_peaks_py[0]))
+    overlap_end = min(float(t_peaks_lv[-1]), float(t_peaks_py[-1]))
     if overlap_end <= overlap_start:
-        raise ValueError("Ingen overlappende tidsinterval mellem LV og PY peaks efter crop.")
+        raise ValueError("Ingen overlappende tidsinterval LV vs PY efter crop.")
 
     lv_ov = t_peaks_lv[(t_peaks_lv >= overlap_start) & (t_peaks_lv <= overlap_end)]
     py_ov = t_peaks_py[(t_peaks_py >= overlap_start) & (t_peaks_py <= overlap_end)]
 
-    # -------------------------
-    # 6) best_delta fra peaks (robust!)
-    # -------------------------
+    # -------- 6) estimer lille delta fra peaks --------
     best_delta = _estimate_delta_from_peaks(lv_ov, py_ov, max_abs_dt_s=1.0)
 
-    # peak matching med den delta
+    # match peaks (KUN overlap-området, internt i match-funktionen)
     tp_lv_idx, tp_py_idx, fn_lv_idx, fp_py_idx = match_rpeaks_time_based_global(
         t_peaks_ref=lv_ov,
         t_peaks_test=py_ov,
         delta_s=best_delta,
-        tol_s=0.04,  # din 40 ms
+        tol_s=0.04,  # 40 ms
     )
 
     if debug:
-        # residual dt for matched
+        print(f"[DEBUG] best_delta_s: {best_delta:.6f}")
+        print(f"[DEBUG] overlap_start/end epoch: {overlap_start:.3f} -> {overlap_end:.3f}")
+        print(f"[DEBUG] matched peaks: {len(tp_lv_idx)}")
         if len(tp_lv_idx) > 0:
-            dt = (lv_ov[tp_lv_idx] - (py_ov[tp_py_idx] + best_delta)) * 1000.0
-            print(f"[DEBUG] best_delta_s: {best_delta:.6f}")
-            print(f"[DEBUG] overlap_start/end epoch: {overlap_start:.3f} -> {overlap_end:.3f}")
-            print(f"[DEBUG] matched peaks: {len(tp_lv_idx)}")
-            print(f"[DEBUG] median |dt| (ms): {np.median(np.abs(dt)):.3f}")
-            print(f"[DEBUG] p95 |dt| (ms): {np.percentile(np.abs(dt), 95):.3f}")
-        else:
-            print(f"[DEBUG] best_delta_s: {best_delta:.6f}  (no matched peaks at tol=40ms)")
+            dt_ms = (py_ov[tp_py_idx] + best_delta - lv_ov[tp_lv_idx]) * 1e3
+            print(f"[DEBUG] median |dt| (ms): {np.median(np.abs(dt_ms)):.3f}")
+            print(f"[DEBUG] p95 |dt| (ms): {np.percentile(np.abs(dt_ms), 95):.3f}")
+
+    if debug and (len(fn_lv_idx) + len(fp_py_idx) > 0):
+        audit_dir = Path(r"E:\Speciale - Results\study3_audit") / f"{cfg.patient_id:02d}_{cfg.recording_id:02d}"
+        uid = getattr(cfg, "recording_uid", f"p{cfg.patient_id:02d}_r{cfg.recording_id:02d}")
+
+        # Hvis du har df_win for denne recording, så giv den med.
+        # Ellers: df_win=None (audit virker stadig).
+        audit_peak_mismatches(
+            ecg_full=ecg_full,   # fuld TDMS (ikke kun cropped)
+            fs=fs,
+            t0_tdms_epoch=t0_tdms_epoch,
+            t_peaks_lv_ov=lv_ov,
+            t_peaks_py_ov=py_ov,
+            best_delta_s=best_delta,
+            tp_lv_idx=tp_lv_idx,
+            tp_py_idx=tp_py_idx,
+            fn_lv_idx=fn_lv_idx,
+            fp_py_idx=fp_py_idx,
+            out_dir=audit_dir,
+            uid=uid,
+            algo_id=str(cfg.algo_id),
+            n_events_each=20,
+            pad_s=2.0,
+            df_win=None,  # <-- kan du koble på senere
+        )
+
 
     peak_metrics = compute_peak_metrics(tp=len(tp_lv_idx), fp=len(fp_py_idx), fn=len(fn_lv_idx))
 
-    # -------------------------
-    # 7) RR alignment + RR metrics (i overlap)
-    # -------------------------
-    rr_lv_ov = np.diff(lv_ov)
-    rr_py_ov = np.diff(py_ov + best_delta)
+    # -------- 7) RR metrics --------
+    rr_lv_ov = np.diff(lv_ov)                 # LV RR i overlap
+    rr_py_ov = np.diff(py_ov + best_delta)    # PY RR i overlap (aligned)
 
-    # match RR via timestamps på "start-peak" for RR-intervallet
     best_delta_rr, rr_lv_m, rr_py_m = find_best_delta(
         t_R_lv=lv_ov[:-1],
         RR_lv=rr_lv_ov,
@@ -953,9 +1122,7 @@ def process_recording(
     )
     rr_metrics = compute_rr_metrics(rr_ref=rr_lv_m, rr_test=rr_py_m)
 
-    # -------------------------
-    # 8) Pak output
-    # -------------------------
+    # -------- 8) output --------
     out: Dict[str, float] = {}
     out.update(rr_metrics)
     out.update(
@@ -965,14 +1132,16 @@ def process_recording(
             "algo_id": str(cfg.algo_id),
             "trim_label": getattr(cfg, "trim_label", None),
 
+            "offset0_s": float(offset0_s),
             "best_delta_s": float(best_delta),
             "best_delta_rr_s": float(best_delta_rr),
-            "offset0_s": float(offset0_s),
+
             "overlap_start": float(overlap_start),
             "overlap_end": float(overlap_end),
 
             "n_peaks_labview_total": int(lv_ov.size),
             "n_peaks_python_total": int(py_ov.size),
+
             "n_peaks_tp": int(peak_metrics["tp"]),
             "n_peaks_fp": int(peak_metrics["fp"]),
             "n_peaks_fn": int(peak_metrics["fn"]),
@@ -985,9 +1154,7 @@ def process_recording(
         }
     )
 
-    # -------------------------
-    # 9) Save aligned RR (valgfrit)
-    # -------------------------
+    # -------- 9) save aligned RR (valgfrit) --------
     if save_aligned_path is not None:
         save_aligned_path.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame({"RR_labview_s": rr_lv_m, "RR_python_s": rr_py_m}).to_csv(save_aligned_path, index=False)
@@ -1401,7 +1568,7 @@ def compare_labview_versions(
     lvm_test_path: str | Path,
     ref_label: str = "ref",
     test_label: str = "test",
-    tol_peak_s: float = 0.05,   # 50 ms peak tolerance
+    tol_peak_s: float = 0.04,   # 40 ms peak tolerance
     delta_range_s: tuple[float, float] = (-2.0, 2.0),
     delta_step_s: float = 0.05,
     tol_rr_s: float = 0.15,     # 150 ms RR-tolerance (til matching)

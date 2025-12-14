@@ -276,6 +276,8 @@ def detect_rpeaks_python(
     if clean_method not in SUPPORTED_CLEAN_METHODS:
         clean_method = "neurokit"
 
+    # print("[DEBUG] method:", method, "ecg_len:", len(ecg), "fs:", fs, "dur_s:", len(ecg)/fs)
+
     # 1) Cleaning
     ecg_clean = nk.ecg_clean(ecg, sampling_rate=fs_int, method=clean_method)
 
@@ -361,8 +363,10 @@ def get_or_compute_rpeaks_idx(
             max_duration_s=max_duration_s,
             recording_uid=recording_uid,
         )
+        # print("[DEBUG] cache_path:", p)
         if (not force_recompute) and p.exists():
             data = np.load(p, allow_pickle=False)
+            # print("[DEBUG] loaded peaks:", r_idx.size, "min/max:", r_idx.min() if r_idx.size else None, r_idx.max() if r_idx.size else None)
             return data["r_idx"].astype(np.int64)
 
     # compute
@@ -1030,23 +1034,27 @@ def process_recording(
 
     # -------- 4) Python peaks (cache på fuld TDMS) + crop til LVM vindue --------
     recording_uid = getattr(cfg, "recording_uid", None)  # hvis du senere tilføjer den til cfg
-    r_idx_py_full = get_or_compute_rpeaks_idx(
-        ecg=ecg_full,
+    
+    
+    ecg_crop = ecg_full[crop_start:crop_end]
+
+    r_idx_py = get_or_compute_rpeaks_idx(
+        ecg=ecg_crop,
         fs=fs,
         cfg=cfg,
-        max_duration_s=max_duration_s,
+        max_duration_s=None,              # (nu er ecg allerede begrænset)
         cache_dir=rpeak_cache_dir,
         force_recompute=force_recompute,
-        recording_uid=recording_uid,
+        recording_uid=getattr(cfg, "recording_uid", None),
+        # cache_suffix=f"crop_{crop_start}_{crop_end}",  # <- tilføj i din cache-path builder
     )
-
-    # vælg de peaks der ligger indenfor crop-vinduet (ORIG tdms indices)
-    m = (r_idx_py_full >= crop_start) & (r_idx_py_full < crop_end)
-    r_idx_py = (r_idx_py_full[m] - crop_start).astype(np.int64)  # lokale indices i crop
     t_peaks_py = t0_crop_epoch + (r_idx_py.astype(float) / fs)
 
     if debug:
-        print(f"[DEBUG] #py_peaks full={int(r_idx_py_full.size)}  cropped={int(r_idx_py.size)}  #lv_peaks={int(t_peaks_lv.size)}")
+        print(f"[DEBUG] #py_peaks full={int(t_peaks_py.size)}  cropped={int(r_idx_py.size)}  #lv_peaks={int(t_peaks_lv.size)}")
+        print(f"[DEBUG] Python peaks crop epoch: {t_peaks_py[0]:.3f} -> {t_peaks_py[-1]:.3f}")
+        print(f"[DEBUG] LabVIEW  peaks        : {t_peaks_lv[0]:.3f} -> {t_peaks_lv[-1]:.3f}")
+        print(f"[DEBUG] Crop epoch start/end : {t0_crop_epoch:.3f} -> {t0_crop_epoch + (len(ecg_crop)/fs):.3f}")
 
     if t_peaks_py.size == 0:
         raise ValueError("Ingen Python-peaks i LVM-vinduet efter crop.")

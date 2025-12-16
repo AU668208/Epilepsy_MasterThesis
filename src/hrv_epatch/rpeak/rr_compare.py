@@ -739,6 +739,91 @@ class AuditEvent:
 def _epoch_to_tdms_sample(t_epoch: float, t0_tdms_epoch: float, fs: float) -> int:
     return int(np.round((t_epoch - t0_tdms_epoch) * fs))
 
+def build_peak_error_eventlog(
+    *,
+    uid: str,
+    patient_id: int,
+    recording_id: int,
+    algo_id: str,
+    tdms_start_epoch: float,
+    lv_ov_epoch: np.ndarray,
+    py_ov_epoch: np.ndarray,
+    delta_lv: float,
+    tol_s: float,
+    tp_lv_idx: np.ndarray,
+    tp_py_idx: np.ndarray,
+    fn_lv_idx: np.ndarray,
+    fp_py_idx: np.ndarray,
+    win_s: float = 10.0,
+    include_tp: bool = False,
+) -> pd.DataFrame:
+    """
+    Event-level log for peak mismatch analysis.
+
+    Convention (matches your Study 3 decision):
+      - Python peaks are NEVER shifted (py_ov_epoch stays fixed).
+      - LabVIEW peaks are shifted by delta_lv (shift_ref=True case).
+
+    Event timestamps are expressed on the TDMS/Python time axis.
+    """
+    lv_ov_epoch = np.asarray(lv_ov_epoch, float).ravel()
+    py_ov_epoch = np.asarray(py_ov_epoch, float).ravel()
+
+    # Shift LV to Python/TDMS axis
+    lv_shift = lv_ov_epoch + float(delta_lv)
+
+    rows = []
+
+    # FN: LV peak missing in PY → event time is shifted LV time
+    for i_lv in fn_lv_idx:
+        t = float(lv_shift[i_lv])
+        rows.append({
+            "uid": uid,
+            "patient_id": int(patient_id),
+            "recording_id": int(recording_id),
+            "algo_id": str(algo_id),
+            "error_type": "FN",
+            "t_event_epoch": t,
+            "t_s": t - float(tdms_start_epoch),
+            "window_idx": int(np.floor((t - float(tdms_start_epoch)) / win_s)),
+            "tol_s": float(tol_s),
+        })
+
+    # FP: PY peak with no LV match → event time is PY time (already TDMS axis)
+    for i_py in fp_py_idx:
+        t = float(py_ov_epoch[i_py])
+        rows.append({
+            "uid": uid,
+            "patient_id": int(patient_id),
+            "recording_id": int(recording_id),
+            "algo_id": str(algo_id),
+            "error_type": "FP",
+            "t_event_epoch": t,
+            "t_s": t - float(tdms_start_epoch),
+            "window_idx": int(np.floor((t - float(tdms_start_epoch)) / win_s)),
+            "tol_s": float(tol_s),
+        })
+
+    if include_tp:
+        # TP rows can be useful for residual diagnostics (dt)
+        for i_lv, i_py in zip(tp_lv_idx, tp_py_idx):
+            t_lv = float(lv_shift[i_lv])
+            t_py = float(py_ov_epoch[i_py])
+            rows.append({
+                "uid": uid,
+                "patient_id": int(patient_id),
+                "recording_id": int(recording_id),
+                "algo_id": str(algo_id),
+                "error_type": "TP",
+                "t_event_epoch": t_py,
+                "t_s": t_py - float(tdms_start_epoch),
+                "window_idx": int(np.floor((t_py - float(tdms_start_epoch)) / win_s)),
+                "dt_ms": (t_py - t_lv) * 1e3,
+                "tol_s": float(tol_s),
+            })
+
+    return pd.DataFrame(rows)
+
 
 def audit_peak_mismatches(
     *,
@@ -1151,6 +1236,33 @@ def process_recording(
         tol_s=0.04,
         shift_ref=True,
     )
+
+    # --- NEW: save FP/FN event log (all events, not sampled) ---
+    eventlog_dir = Path(r"E:\Speciale - Results\study3_peak_eventlog")
+    eventlog_dir.mkdir(parents=True, exist_ok=True)
+
+    uid = getattr(cfg, "recording_uid", f"P{cfg.patient_id:02d}_R{cfg.recording_id:02d}")
+
+    df_events = build_peak_error_eventlog(
+        uid=uid,
+        patient_id=cfg.patient_id,
+        recording_id=cfg.recording_id,
+        algo_id=str(cfg.algo_id),
+        tdms_start_epoch=float(t0_tdms_epoch),
+        lv_ov_epoch=lv_ov,          # raw LV overlap (epoch)
+        py_ov_epoch=py_ov,          # PY overlap (epoch)
+        delta_lv=float(delta_lv),   # shift LV only
+        tol_s=float(tol_s),
+        tp_lv_idx=tp_lv_idx,
+        tp_py_idx=tp_py_idx,
+        fn_lv_idx=fn_lv_idx,
+        fp_py_idx=fp_py_idx,
+        win_s=10.0,
+        include_tp=False,           # start with FP/FN only
+    )
+
+    df_events.to_csv(eventlog_dir / f"{uid}__{cfg.algo_id}__peak_errors.csv", index=False)
+
 
     # dt for matched peaks (PY fixed, LV shifted by delta_lv)
     if len(tp_lv_idx) > 0:
